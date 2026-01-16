@@ -7,6 +7,9 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
+import torch._dynamo
+# NOTE: Some Bugs with Dynamo
+torch._dynamo.config.suppress_errors = True
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state

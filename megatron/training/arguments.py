@@ -1327,6 +1327,9 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    if args.octopipe:
+        kw_args['batch_p2p_comm'] = False
+        kw_args['overlap_p2p_comm'] = True
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
@@ -2209,7 +2212,10 @@ def _add_training_args(parser):
     group.add_argument('--calculate-per-token-loss', action='store_true',
                        help=('Scale cross entropy loss by the number of non-padded tokens in the '
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
-
+    group.add_argument('--octopipe', action='store_true',
+                       help='Enable OctoPipe for pipeline parallelism')
+    group.add_argument('--octopipe-config-dir', type=str, default=None,
+                       help='OctoPipe config dir path.')
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '

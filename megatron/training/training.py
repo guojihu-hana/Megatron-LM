@@ -1370,17 +1370,52 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-        )
+        args = get_args()        
+        if getattr(args, 'octopipe', False):
+            if not hasattr(train_step, "_octopipe_initialized"):
+                from octopipe.generate_inst import get_octopipe_config
+
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+                octopipe_config_dir = os.path.join(project_root, "octopipe", args.octopipe_config_dir)
+                partition_path = os.path.join(octopipe_config_dir, "partition.txt")
+                placement_path = os.path.join(octopipe_config_dir, "placement.txt")
+                results_path = os.path.join(octopipe_config_dir, "result.txt")
+
+                train_step.octopipe_config = get_octopipe_config(
+                    partition_path=partition_path,
+                    placement_path=placement_path,
+                    results_path=results_path,
+                )
+
+                train_step._octopipe_initialized = True
+
+            octopipe_config = train_step.octopipe_config
+
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                octopipe_config=octopipe_config,
+            )
+        else:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+            )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
@@ -1501,6 +1536,9 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
+
+    if not hasattr(training_log, "_cum_throughput"):
+        training_log._cum_throughput = 0.0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -1725,7 +1763,15 @@ def training_log(
             elapsed_time_per_iteration * 1000.0
         )
         if args.log_throughput:
+            
+            if iteration > 1:
+                training_log._cum_throughput += throughput
+                avg_throughput = (
+                    training_log._cum_throughput / (iteration - 1)
+                )
+                log_string += f' Avg throughput per GPU (TFLOP/s/GPU): {avg_throughput:.1f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
@@ -2284,6 +2330,7 @@ def train(
         and torch.distributed.get_rank() in args.profile_ranks
         and args.use_pytorch_profiler
     ):
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),
@@ -2291,9 +2338,9 @@ def train(
                 active=args.profile_step_end - args.profile_step_start,
                 repeat=1,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(args.tensorboard_dir, f"PP_rank_{pp_rank}")),
             record_shapes=True,
-            with_stack=True,
+            with_stack=False,
         )
         prof.start()
 

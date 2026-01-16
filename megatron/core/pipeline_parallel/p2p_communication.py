@@ -126,6 +126,46 @@ def _p2p_ops(
             reqs["send_prev"] = send_prev_req
     return reqs
 
+def _p2p_ops_octopipe(
+    *,
+    tensor_send: Optional[torch.Tensor],
+    tensor_recv: Optional[torch.Tensor],
+    group: torch.distributed.ProcessGroup,
+    recv_src_rank: int,
+    send_dst_rank: int,
+):
+    reqs = {}
+    even_send_odd_recv_group = group
+
+    # NOTE: Set to None when OctoPipe enabled.
+    even_send_odd_recv_group = None
+    even_recv_odd_send_group = None
+
+    if group.rank() % 2 == 0:
+        if tensor_recv is not None:
+            recv_prev_req = torch.distributed.irecv(
+                tensor=tensor_recv, src=recv_src_rank, group=even_recv_odd_send_group
+            )
+            reqs["recv"] = recv_prev_req
+
+        if tensor_send is not None:
+            send_prev_req = torch.distributed.isend(
+                tensor=tensor_send, dst=send_dst_rank, group=even_send_odd_recv_group
+            )
+            reqs["send"] = send_prev_req
+    else:
+        if tensor_recv is not None:
+            recv_prev_req = torch.distributed.irecv(
+                tensor=tensor_recv, src=recv_src_rank, group=even_send_odd_recv_group
+            )
+            reqs["recv"] = recv_prev_req
+
+        if tensor_send is not None:
+            send_prev_req = torch.distributed.isend(
+                tensor=tensor_send, dst=send_dst_rank, group=even_recv_odd_send_group
+            )
+            reqs["send"] = send_prev_req
+    return reqs
 
 def is_single_shape(x) -> bool:
     """Check if the input is a single shape."""
@@ -150,7 +190,7 @@ class P2PCommunicator:
 
         world_size = self.pp_group.size()
         curr_rank_in_pg = self.pp_group.rank()
-
+        self.curr_rank_in_pg = curr_rank_in_pg
         next_rank_pg = (curr_rank_in_pg + 1) % world_size
         prev_rank_pg = (curr_rank_in_pg - 1) % world_size
 
@@ -399,6 +439,56 @@ class P2PCommunicator:
 
         return tensor_recv_prev, tensor_recv_next, reqs
 
+    def _communicate_async(
+        self,
+        *,
+        tensor_send: Optional[torch.Tensor],
+        send_dst_rank: int,
+        need_recv: bool,
+        recv_src_rank: int,
+        tensor_shape: Shape,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        config = self.config
+
+        def create_tensor_recv():
+            return torch.empty(
+                tensor_shape,
+                requires_grad=True,
+                device=torch.cuda.current_device(),
+                dtype=config.pipeline_dtype,
+            )
+
+        # Send tensors in both the forward and backward directions as appropriate.
+        pp_group = self.pp_group
+        reqs = {}
+
+        tensor_recv = None
+        if need_recv:
+            if config.pipeline_dtype is None:
+                raise RuntimeError("dtype must be provided if recv_next is True")
+            if tensor_shape is None:
+                raise RuntimeError(
+                    "tensor_shape must be specified if recv_next is True. "
+                    "Common tensor_shape is (seq_length, micro_batch_size, hidden_size)"
+                )
+            tensor_recv = create_tensor_recv()
+
+        p2p_reqs = _p2p_ops_octopipe(
+            tensor_send=tensor_send,
+            tensor_recv=tensor_recv,
+            group=pp_group,
+            send_dst_rank=send_dst_rank,
+            recv_src_rank=recv_src_rank,
+        )
+
+        if isinstance(p2p_reqs, list):
+            reqs.extend(p2p_reqs)
+        else:
+            reqs.update(p2p_reqs)
+
+        return tensor_recv, reqs
+    
     @nvtx_decorator()
     def recv_forward(
         self, tensor_shapes, is_first_stage: bool
@@ -481,7 +571,195 @@ class P2PCommunicator:
                 )
                 if config.timers is not None:
                     config.timers('forward-send').stop()
+    
+    @nvtx_decorator()
+    def send_tensor_async(self, send_tensors, dst_rank, stop=False) -> None:
+        """Send tensor to next rank in pipeline (forward send)."""
+        config = self.config
+        if not isinstance(send_tensors, list):
+            send_tensors = [send_tensors]
 
+        reqs = []
+        for send_tensor in send_tensors:
+            if config.timers is not None:
+                config.timers('forward-send', log_level=2).start()
+            
+            if stop:
+                import pdb
+                pdb.set_trace()
+
+            _, req = self._communicate_async(
+                tensor_send=send_tensor,
+                send_dst_rank=dst_rank,
+                need_recv=False,
+                recv_src_rank=None,
+                tensor_shape=None,
+            )
+
+            if config.timers is not None:
+                config.timers('forward-send').stop()
+        return reqs
+
+    @nvtx_decorator()
+    def recv_tensor_async(
+        self, tensor_shapes, recv_src_rank
+    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        """Receive tensor from next rank in pipeline (backward receive)."""
+        unwrap_tensor_shapes = False
+        if is_single_shape(tensor_shapes):
+            unwrap_tensor_shapes = True
+            tensor_shapes = [tensor_shapes]
+        config = self.config
+        output_tensor_grads = []
+        reqs = []
+        for tensor_shape in tensor_shapes:
+            if config.timers is not None:
+                config.timers('backward-recv', log_level=2).start()
+            output_tensor_grad, req = self._communicate_async(
+                tensor_send=None,
+                send_dst_rank=None,
+                need_recv=True,
+                recv_src_rank=recv_src_rank,
+                tensor_shape=tensor_shape,
+            )
+            if config.timers is not None:
+                config.timers('backward-recv').stop()
+            output_tensor_grads.append(output_tensor_grad)
+            reqs.append(req['recv'])
+        if unwrap_tensor_shapes:
+            return output_tensor_grads[0], reqs
+        return output_tensor_grads, reqs
+
+    @nvtx_decorator()
+    def send_forward_async(self, output_tensors, is_last_stage: bool, stop=False) -> None:
+        """Send tensor to next rank in pipeline (forward send)."""
+        config = self.config
+        if not isinstance(output_tensors, list):
+            output_tensors = [output_tensors]
+
+        reqs = []
+        for output_tensor in output_tensors:
+            if not is_last_stage:
+                if config.timers is not None:
+                    config.timers('forward-send', log_level=2).start()
+                
+                if stop:
+                    import pdb
+                    pdb.set_trace()
+
+                _, _, req = self._communicate(
+                    tensor_send_next=output_tensor,
+                    tensor_send_prev=None,
+                    recv_prev=False,
+                    recv_next=False,
+                    tensor_shape=None,
+                    wait_on_reqs=False,
+                )
+                reqs.append(req["send_next"])
+                if config.timers is not None:
+                    config.timers('forward-send').stop()
+        return reqs
+
+    @nvtx_decorator()
+    def send_backward_async(self, input_tensor_grads, is_first_stage: bool) -> None:
+        """Send tensor to previous rank in pipeline (backward send)."""
+        if not isinstance(input_tensor_grads, list):
+            input_tensor_grads = [input_tensor_grads]
+        config = self.config
+
+        reqs = []
+        for input_tensor_grad in input_tensor_grads:
+            if not is_first_stage:
+                if config.timers is not None:
+                    config.timers('backward-send', log_level=2).start()
+                _, _, req = self._communicate(
+                    tensor_send_next=None,
+                    tensor_send_prev=input_tensor_grad,
+                    recv_prev=False,
+                    recv_next=False,
+                    tensor_shape=None,
+                    wait_on_reqs=False,
+                )
+                reqs.append(req["send_prev"])
+                if config.timers is not None:
+                    config.timers('backward-send').stop()
+        return reqs
+
+    @nvtx_decorator()
+    def recv_forward_async(
+        self, tensor_shapes, is_first_stage: bool, stop=False
+    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        """Receive tensor from previous rank in pipeline (forward receive)."""
+        unwrap_tensor_shapes = False
+        if is_single_shape(tensor_shapes):
+            unwrap_tensor_shapes = True
+            tensor_shapes = [tensor_shapes]
+        input_tensors = []
+        reqs = []
+        config = self.config
+        for tensor_shape in tensor_shapes:
+            if is_first_stage:
+                input_tensor = None
+            else:
+                if config.timers is not None:
+                    config.timers('forward-recv', log_level=2).start()
+                
+                if stop:
+                    import pdb
+                    pdb.set_trace()
+
+                input_tensor, _, req = self._communicate(
+                    tensor_send_next=None,
+                    tensor_send_prev=None,
+                    recv_prev=True,
+                    recv_next=False,
+                    tensor_shape=tensor_shape,
+                    wait_on_reqs=False,
+                )
+                
+                if config.timers is not None:
+                    config.timers('forward-recv').stop()
+            input_tensors.append(input_tensor)
+            reqs.append(req['recv_prev'])
+            
+        if unwrap_tensor_shapes:
+            return input_tensors[0], reqs
+        return input_tensors, reqs
+
+    @nvtx_decorator()
+    def recv_backward_async(
+        self, tensor_shapes, is_last_stage: bool
+    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        """Receive tensor from next rank in pipeline (backward receive)."""
+        unwrap_tensor_shapes = False
+        if is_single_shape(tensor_shapes):
+            unwrap_tensor_shapes = True
+            tensor_shapes = [tensor_shapes]
+        config = self.config
+        output_tensor_grads = []
+        reqs = []
+        for tensor_shape in tensor_shapes:
+            if is_last_stage:
+                output_tensor_grad = None
+            else:
+                if config.timers is not None:
+                    config.timers('backward-recv', log_level=2).start()
+                _, output_tensor_grad, req = self._communicate(
+                    tensor_send_next=None,
+                    tensor_send_prev=None,
+                    recv_prev=False,
+                    recv_next=True,
+                    tensor_shape=tensor_shape,
+                    wait_on_reqs=False,
+                )
+                if config.timers is not None:
+                    config.timers('backward-recv').stop()
+            output_tensor_grads.append(output_tensor_grad)
+            reqs.append(req['recv_next'])
+        if unwrap_tensor_shapes:
+            return output_tensor_grads[0], reqs
+        return output_tensor_grads, reqs
+    
     @nvtx_decorator()
     def send_backward(self, input_tensor_grads, is_first_stage: bool) -> None:
         """Send tensor to previous rank in pipeline (backward send)."""
