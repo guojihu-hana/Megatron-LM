@@ -73,6 +73,7 @@ class MambaStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
+        vp_stage: int,
         residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
@@ -94,6 +95,7 @@ class MambaStack(MegatronModule):
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp
+        self.vp_stage = vp_stage
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -127,6 +129,7 @@ class MambaStack(MegatronModule):
                         layer_number=i + 1 + pp_layer_offset,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        vp_stage=self.vp_stage,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     # Transformer layers apply their own pp_layer_offset
@@ -135,6 +138,7 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         layer_number=i + 1,
                         pg_collection=pg_collection,
+                        vp_stage=self.vp_stage,
                     )
                 elif layer_type == LayerSymbols.MLP:
                     # Transformer layers apply their own pp_layer_offset
@@ -143,11 +147,13 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         layer_number=i + 1,
                         pg_collection=pg_collection,
+                        vp_stage=self.vp_stage,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1
+                        submodules.moe_layer, config=self.config, layer_number=i + 1,
+                        vp_stage=self.vp_stage,
                     )
                 else:
                     assert False, "unexpected layer_type"
@@ -167,10 +173,23 @@ class MambaStack(MegatronModule):
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
 
-        assert self.config.virtual_pipeline_model_parallel_size is None, (
-            "The Mamba hybrid model does not currently support "
-            "virtual/interleaved pipeline parallelism"
-        )
+        # assert self.config.virtual_pipeline_model_parallel_size is None, (
+        #     "The Mamba hybrid model does not currently support "
+        #     "virtual/interleaved pipeline parallelism"
+        # )
+        vp_size = self.config.virtual_pipeline_model_parallel_size
+        if vp_size is not None and self.config.pipeline_model_parallel_size > 1:
+            assert (
+                num_layers_per_pipeline_rank % vp_size == 0
+            ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
+                should be divisible by vp_size {vp_size}"
+            num_layers_per_virtual_stage = num_layers_per_pipeline_rank // vp_size
+            num_layers_per_pipeline_rank = num_layers_per_virtual_stage
+
+            offset = self.pp_group.rank() * num_layers_per_pipeline_rank + (self.vp_stage * self.pp_group.size() * num_layers_per_pipeline_rank)
+            selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
+
+            return offset, selected_list
 
         offset = self.pp_group.rank() * num_layers_per_pipeline_rank
         selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]

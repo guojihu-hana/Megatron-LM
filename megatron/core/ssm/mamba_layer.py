@@ -62,6 +62,7 @@ class MambaLayer(GraphableMegatronModule):
         residual_in_fp32=False,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
+        vp_stage = None,
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)
@@ -80,6 +81,7 @@ class MambaLayer(GraphableMegatronModule):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
         )
+        self.vp_stage = vp_stage
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad

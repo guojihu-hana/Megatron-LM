@@ -59,6 +59,7 @@ class MambaModel(LanguageModule):
         mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
+        vp_stage: int,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
@@ -92,6 +93,7 @@ class MambaModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+        self.vp_stage = vp_stage
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -120,6 +122,7 @@ class MambaModel(LanguageModule):
         self.decoder = build_module(
             mamba_stack_spec,
             self.config,
+            vp_stage=self.vp_stage,
             pre_process=self.pre_process,
             hybrid_attention_ratio=self.hybrid_attention_ratio,
             hybrid_mlp_ratio=self.hybrid_mlp_ratio,

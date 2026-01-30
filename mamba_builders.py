@@ -24,6 +24,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
 
     model = MambaModel(
         config=config,
+        vp_stage=vp_stage,
         mamba_stack_spec=mamba_stack_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
