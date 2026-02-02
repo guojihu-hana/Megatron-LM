@@ -65,35 +65,39 @@ def legal_pair(op1, op2):
     return False
 
 
-def get_pair_comm_ops(workloads, dev_a, dev_b):
+def get_pair_comm_ops(workloads, dev_a, dev_b, device_stage_mappings):
     """
     Return all send and recv ops whose sender and receiver are dev_a and dev_b.
     """
-    pair = {dev_a, dev_b}
+    sids_on_dev_a = device_stage_mappings[dev_a]
+    sids_on_dev_b = device_stage_mappings[dev_b]
     comm_ops_a = []
     comm_ops_b = []
 
     for workload in workloads[dev_a]:
-        if {workload.get("sender_sid"), workload.get("recver_sid")} == pair:
+        if workload.get("sender_sid") in sids_on_dev_b and workload.get("recver_sid") in sids_on_dev_a:
+            comm_ops_a.append(workload)
+        elif workload.get("recver_sid") in sids_on_dev_b and workload.get("sender_sid") in sids_on_dev_a:
             comm_ops_a.append(workload)
     for workload in workloads[dev_b]:
-        if {workload.get("sender_sid"), workload.get("recver_sid")} == pair:
+        if workload.get("sender_sid") in sids_on_dev_b and workload.get("recver_sid") in sids_on_dev_a:
+            comm_ops_b.append(workload)
+        elif workload.get("recver_sid") in sids_on_dev_b and workload.get("sender_sid") in sids_on_dev_a:
             comm_ops_b.append(workload)
 
     return comm_ops_a, comm_ops_b
 
-def reorder_pair_minimally(res, dev_a, dev_b, debug=False):
+def reorder_pair_minimally(res, dev_a, dev_b, debug=True):
     """
     Fix deadlock between dev_a and dev_b by insertion-only reordering.
     """
     solved_dead_lock = 0
     exist_dead_lock = True
+    workloads = res["workloads"]
+    device_stage_mappings = res["did->sid"]
+    comm_ops_a, comm_ops_b = get_pair_comm_ops(workloads, dev_a=dev_a, dev_b=dev_b, device_stage_mappings=device_stage_mappings)
     while exist_dead_lock:
         exist_dead_lock = False
-        workloads = res["workloads"]
-        comm_ops_a, comm_ops_b = get_pair_comm_ops(
-            workloads, dev_a=dev_a, dev_b=dev_b
-        )
         assert len(comm_ops_a) == len(comm_ops_b)
         # print_ops(res["workloads"], s_sid=[6,7], r_sid=[6,7])
         for idx in range(len(comm_ops_a)):
@@ -105,11 +109,14 @@ def reorder_pair_minimally(res, dev_a, dev_b, debug=False):
                 recv = find_matching_recv(workloads[dev_b], op_a)
                 w = workloads[dev_b]
                 insert_pos = w.index(op_b)
+                print(op_a, op_b,'---------------')
+                print_ops(res['workloads'], s_sid=[1,2], r_sid=[1,2], num=65)
                 w.remove(recv)
                 recv['start_time'] = op_b['start_time']
                 w.insert(insert_pos, recv)
                 exist_dead_lock = True
                 solved_dead_lock += 1
+                print_ops(res['workloads'], s_sid=[1,2], r_sid=[1,2], num=65)
                 if debug:
                     print(f"solve {idx}, {op_a}, {op_b}, 1")
                 break
@@ -125,59 +132,9 @@ def reorder_pair_minimally(res, dev_a, dev_b, debug=False):
                 if debug:
                     print(f"solve {op_a}, {op_b}, 2")
                 break
-            else:
-                pass
-            # case a: send recv
-            # if is_send(op_a) and is_recv(op_b):
-            #     # print_ops(res['workloads'], s=0, num=100, s_sid=[0,1], r_sid=[0,1])
-            #     recv = find_matching_recv(workloads[dev_b], op_a)
-            #     w = workloads[dev_b]
-            #     w.remove(recv)
-            #     insert_pos = w.index(op_b)
-            #     w.insert(insert_pos, recv)
-            #     exist_dead_lock = True
-            #     solved_dead_lock += 1
-            #     if debug:
-            #         print(f"solve {idx}, {op_a}, {op_b}, 1")
-            #     break
-            # # case b: recv send
-            # elif is_recv(op_a) and is_send(op_b):
-            #     recv = find_matching_recv(workloads[dev_a], op_b)
-            #     w = workloads[dev_a]
-            #     w.remove(recv)
-            #     insert_pos = w.index(op_a)
-            #     w.insert(insert_pos, recv)
-            #     exist_dead_lock = True
-            #     solved_dead_lock += 1
-            #     if debug:
-            #         print(f"solve {op_a}, {op_b}, 2")
-            #     break
-            # # case c: send send
-            # elif is_send(op_a) and is_send(op_b):
-            #     recv_a = find_matching_recv(workloads[dev_b], op_a)
-            #     recv_b = find_matching_recv(workloads[dev_a], op_b)
-
-            #     # move recv_a before op_b
-            #     w_b = workloads[dev_b]
-            #     w_b.remove(recv_a)
-            #     pos_b = w_b.index(op_b)
-            #     w_b.insert(pos_b, recv_a)
-
-            #     # move recv_b after op_a
-            #     w_a = workloads[dev_a]
-            #     w_a.remove(recv_b)
-            #     pos_a = w_a.index(op_a)
-            #     w_a.insert(pos_a + 1, recv_b)
-
-            #     exist_dead_lock = True
-            #     solved_dead_lock += 1
-            #     if debug:
-            #         print(f"solve {op_a}, {op_b}, 3")
-            #     break
-            # # case d: recv recv
-            # else:
-            #     # No such cases
-            #     pass
+            elif is_recv(op_a) and is_recv(op_b):
+                # case: recv + recv
+                print("Potential deadlock unsolved.")
     return solved_dead_lock
 
 def reorder_comm_ops(res, dev_a, dev_b):
@@ -251,9 +208,12 @@ def reorder_send_recv_pairs(res):
     while num_potential_dead_locks > 0:
         num_potential_dead_locks = 0
         for i in range(len(devices)):
-            for j in range(i + 1, len(devices)):
+            for j in range(len(devices)):
+                if i == j:
+                    continue
                 num_potential_dead_locks += reorder_pair_minimally(res, devices[i], devices[j])
         print(f"Number of solved dead locks: {num_potential_dead_locks}")
+
 
 def delay_send(res, sender_did):
     sender_workloads = res["workloads"][sender_did]
@@ -815,6 +775,8 @@ def overlap_aware_comm_insert(
         comm_ops[did].append([])
 
     for did, workloads in workload_exe_order.items():
+    # for did in reversed(list(workload_exe_order.keys())):
+        workloads = workload_exe_order[did]
         for w in workloads:
             if w['op'] != 'comp':
                 continue
@@ -882,6 +844,14 @@ def overlap_aware_comm_insert(
         for idx, workload in enumerate(workloads):
             workload_comp_comm_order[device_id].append(workload)
             workload_comp_comm_order[device_id].extend(comm_ops[device_id][idx+1])
+    # workload_comp_comm_order: Dict[int, List[Dict]] = {}
+    # # initialize with existing compute workloads
+    # for device_id, workloads in workload_exe_order.items():
+    #     workload_comp_comm_order[device_id] = []
+    #     workload_comp_comm_order[device_id].extend(sorted(comm_ops[device_id][0], key=lambda x : x['start_time']))
+    #     for idx, workload in enumerate(workloads):
+    #         workload_comp_comm_order[device_id].append(workload)
+    #         workload_comp_comm_order[device_id].extend(sorted(comm_ops[device_id][idx+1], key=lambda x : x['start_time']))
     # print_ops(workload_comp_comm_order=workload_comp_comm_order, skip_comp=False)
     return workload_comp_comm_order
             
@@ -923,7 +893,7 @@ def get_octopipe_config(partition_path, placement_path, results_path):
     }
     # print_ops(res["workloads"], skip_comp=False, num=30)
     # delay_send_for_overlap(res=res)
-    reorder_send_recv_pairs(res=res)
+    # reorder_send_recv_pairs(res=res)
     # advance_recv_for_overlap(res=res)
     # reorder_send_recv_pairs(res=res)
     # reorder_cross_comm_pairs(res=res)
@@ -974,9 +944,10 @@ def print_ops(workload_comp_comm_order, skip_comp=True, s_sid:list=[], r_sid:lis
             wtype = str(workload['type']).upper()
             if workload['op'] == 'comp':
                 op = 'C'
+                sid = workload['sid']
                 color = COLOR_COMP
-                output = f"{op}{wtype}{mid}"
-                print(f"{color}{output:<{width}}{COLOR_RESET}", end="")
+                output = f"{wtype}{mid}{sid}"
+                print(f"{color}{idx+s} {output:<{width}}{COLOR_RESET}", end="")
             else:
                 if s_sid:
                     if workload['sender_sid'] not in s_sid and workload['sender_sid'] not in r_sid:
@@ -993,7 +964,7 @@ def print_ops(workload_comp_comm_order, skip_comp=True, s_sid:list=[], r_sid:lis
                 sender_sid = workload['sender_sid']
                 recver_sid = workload['recver_sid']
                 output = f"{op}{wtype}{mid}{sender_sid}{recver_sid}"
-                print(f"{color}{output:<{width}}{COLOR_RESET}", end="")
+                print(f"{color}{idx+s} {output:<{width}}{COLOR_RESET}", end="")
         print()
 
 def recv_forward():
@@ -1036,7 +1007,8 @@ def Pipeline_Schedule_of_1F1B(nmb_warmup, nmb_remaining):
 if __name__ == "__main__":
     import os
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config")
+    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/multi_chunk")
+    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
 
     partition_path = os.path.join(DEBUG_CONFIG_DIR, "partition.txt")
     placement_path = os.path.join(DEBUG_CONFIG_DIR, "placement.txt")
@@ -1045,3 +1017,6 @@ if __name__ == "__main__":
     res = get_octopipe_config(partition_path=partition_path,placement_path=placement_path,results_path=results_path)
     print(res["sid->did"])
     print(res["did->sid"])
+    # print(res["workloads"][0][:10])
+    # print_ops(res['workloads'], skip_comp=False,num=20, s=70)
+    # print_ops(res['workloads'], s_sid=[6, 14, 22, 30, 7, 15, 23, 31], r_sid=[6, 14, 22, 30, 7, 15, 23, 31], num=90)

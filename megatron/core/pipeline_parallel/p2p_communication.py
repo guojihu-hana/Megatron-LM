@@ -135,36 +135,18 @@ def _p2p_ops_octopipe(
     send_dst_rank: int,
 ):
     reqs = {}
-    even_send_odd_recv_group = group
+    if tensor_recv is not None:
+        recv_prev_req = torch.distributed.irecv(
+            tensor=tensor_recv, src=recv_src_rank, group=group
+        )
+        reqs["recv"] = recv_prev_req
 
-    # NOTE: Set to None when OctoPipe enabled.
-    even_send_odd_recv_group = None
-    even_recv_odd_send_group = None
-
-    if group.rank() % 2 == 0:
-        if tensor_recv is not None:
-            recv_prev_req = torch.distributed.irecv(
-                tensor=tensor_recv, src=recv_src_rank, group=even_recv_odd_send_group
-            )
-            reqs["recv"] = recv_prev_req
-
-        if tensor_send is not None:
-            send_prev_req = torch.distributed.isend(
-                tensor=tensor_send, dst=send_dst_rank, group=even_send_odd_recv_group
-            )
-            reqs["send"] = send_prev_req
-    else:
-        if tensor_recv is not None:
-            recv_prev_req = torch.distributed.irecv(
-                tensor=tensor_recv, src=recv_src_rank, group=even_send_odd_recv_group
-            )
-            reqs["recv"] = recv_prev_req
-
-        if tensor_send is not None:
-            send_prev_req = torch.distributed.isend(
-                tensor=tensor_send, dst=send_dst_rank, group=even_recv_odd_send_group
-            )
-            reqs["send"] = send_prev_req
+    if tensor_send is not None:
+        send_prev_req = torch.distributed.isend(
+            tensor=tensor_send, dst=send_dst_rank, group=group
+        )
+        reqs["send"] = send_prev_req
+    
     return reqs
 
 def is_single_shape(x) -> bool:

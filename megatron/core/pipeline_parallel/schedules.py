@@ -8,6 +8,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.weight_gradient_store import WeightGradStore
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
@@ -2840,6 +2841,13 @@ def forward_backward_pipelining_of_octopipe(
 
     forward_data_store = []
 
+    WeightGradStore.split_bw = False
+    for workload in workloads:
+        wtype = workload['type']
+        if wtype == 'w':
+            WeightGradStore.split_bw = True
+            break
+
     for wid, workload in enumerate(workloads):
         # print(f"PP {pp_rank} bgn {wid}, {workload}", flush=True)
         op = workload['op']
@@ -2914,10 +2922,14 @@ def forward_backward_pipelining_of_octopipe(
                 input_tensor_grad = backward_step(
                     input_tensor, output_tensor, output_tensor_grad, model_type, config
                 )
+                if WeightGradStore.split_bw:
+                    WeightGradStore.flush()
 
                 input_tensor_grads[mid][sid] = input_tensor_grad
             elif wtype == 'w':
                 # NOTE: should support backward-splitting
+                # NOTE: W only FIFO execution order
+                WeightGradStore.pop()
                 pass
             else:
                 raise ValueError(f"{op} Workload Type Error: {wtype}")
