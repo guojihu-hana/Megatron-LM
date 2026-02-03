@@ -430,7 +430,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, vp_stage=None):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -1288,7 +1288,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
         input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
+            input_tensor, output_tensor, output_tensor_grad, model_type, config, vp_stage=model_chunk_id
         )
 
         backward_step_helper_postprocess(virtual_microbatch_id)

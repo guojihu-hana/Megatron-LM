@@ -11,8 +11,10 @@ import inspect
 import logging
 import math
 import os
+import json
 import sys
 from typing import Any, Optional
+from collections import defaultdict
 
 import torch.distributed
 
@@ -153,6 +155,108 @@ stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
+from functools import wraps
+
+def gpu_timer_wrapper(func, record_list):
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        if "vp_stage" in kwargs:
+            vp_stage = kwargs["vp_stage"]
+        else:
+            vp_stage = mpu.get_pipeline_model_parallel_rank()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        out = func(*args, **kwargs)
+        end.record()
+
+        record_list.append({
+            "vp_stage": vp_stage,
+            "start": start,
+            "end": end,
+        })
+
+        return out
+
+    return wrapped
+
+def dump_pp_timing_to_json(
+    forward_events,
+    backward_events,
+    pp_rank,
+    output_dir="pp_stage_time"
+):
+    args = get_args()
+    train_iters = args.train_iters
+
+    def group_by_vp_stage(events):
+        grouped = defaultdict(list)
+        for rec in events:
+            vp = rec["vp_stage"]
+            t = rec["start"].elapsed_time(rec["end"])
+            grouped[vp].append(t)
+        return grouped
+
+    fwd_by_vp = group_by_vp_stage(forward_events)
+    bwd_by_vp = group_by_vp_stage(backward_events)
+
+    vp_stage_stats = {}
+
+    for vp_stage in sorted(set(fwd_by_vp.keys()) | set(bwd_by_vp.keys())):
+        fwd_times = fwd_by_vp.get(vp_stage, [])
+        bwd_times = bwd_by_vp.get(vp_stage, [])
+
+        fwd_steps_per_iter = len(fwd_times) // train_iters if train_iters > 0 else 0
+        bwd_steps_per_iter = len(bwd_times) // train_iters if train_iters > 0 else 0
+
+        fwd_exc_1 = (
+            fwd_times[fwd_steps_per_iter:]
+            if fwd_steps_per_iter > 0 else fwd_times
+        )
+        bwd_exc_1 = (
+            bwd_times[bwd_steps_per_iter:]
+            if bwd_steps_per_iter > 0 else bwd_times
+        )
+
+        vp_stage_stats[vp_stage] = {
+            "num_forward_steps": len(fwd_times),
+            "num_backward_steps": len(bwd_times),
+            "forward_avg_ms": (
+                sum(fwd_times) / len(fwd_times) if fwd_times else 0.0
+            ),
+            "backward_avg_ms": (
+                sum(bwd_times) / len(bwd_times) if bwd_times else 0.0
+            ),
+            "forward_avg_ms_exc_1": (
+                sum(fwd_exc_1) / len(fwd_exc_1) if fwd_exc_1 else 0.0
+            ),
+            "backward_avg_ms_exc_1": (
+                sum(bwd_exc_1) / len(bwd_exc_1) if bwd_exc_1 else 0.0
+            ),
+        }
+
+    model_name = os.environ.get("MODEL", "unknown_model")
+    output_dir = os.path.join("pp_timing", model_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    data = {
+        "pp_rank": pp_rank,
+        "train_iters": train_iters,
+        "vp_stages": vp_stage_stats,
+    }
+
+    json_path = os.path.join(
+        output_dir,
+        f"pp_{pp_rank}.json"
+    )
+
+    with open(json_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    return json_path
 
 def destroy_global_state():
     destroy_global_vars()
@@ -774,6 +878,19 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
+    forward_events = []
+    backward_events = []
+    from megatron.core.pipeline_parallel import schedules
+    schedules.forward_step = gpu_timer_wrapper(
+        schedules.forward_step,
+        forward_events
+    )
+
+    schedules.backward_step = gpu_timer_wrapper(
+        schedules.backward_step,
+        backward_events
+    )
+
     if not args.skip_train:
         print_rank_0('training ...')
 
@@ -820,6 +937,12 @@ def pretrain(
 
         iteration = args.iteration
 
+    dump_pp_timing_to_json(
+        forward_events,
+        backward_events,
+        mpu.get_pipeline_model_parallel_rank(),
+    )
+    
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
         if getattr(args, 'perform_rl_step', False):
