@@ -139,6 +139,7 @@ from .utils import (
 from .global_vars import (
     destroy_global_vars,
     get_args,
+    get_octopipe_config,
     get_signal_handler,
     get_timers,
     get_tensorboard_writer,
@@ -1496,21 +1497,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         args = get_args()        
         if getattr(args, 'octopipe', False):
             if not hasattr(train_step, "_octopipe_initialized"):
-                from octopipe.generate_inst import get_octopipe_config
 
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
-                octopipe_config_dir = os.path.join(project_root, "octopipe", args.octopipe_config_dir)
-                partition_path = os.path.join(octopipe_config_dir, "partition.txt")
-                placement_path = os.path.join(octopipe_config_dir, "placement.txt")
-                results_path = os.path.join(octopipe_config_dir, "result.txt")
-
-                train_step.octopipe_config = get_octopipe_config(
-                    partition_path=partition_path,
-                    placement_path=placement_path,
-                    results_path=results_path,
-                )
-
+                train_step.octopipe_config = get_octopipe_config()
                 train_step._octopipe_initialized = True
 
             octopipe_config = train_step.octopipe_config

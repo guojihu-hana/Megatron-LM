@@ -836,22 +836,22 @@ def overlap_aware_comm_insert(
                 comm_ops[recver_did][recv_idx].append(recv_op)
 
     # print(comm_ops)
-    workload_comp_comm_order: Dict[int, List[Dict]] = {}
-    # initialize with existing compute workloads
-    for device_id, workloads in workload_exe_order.items():
-        workload_comp_comm_order[device_id] = []
-        workload_comp_comm_order[device_id].extend(comm_ops[device_id][0])
-        for idx, workload in enumerate(workloads):
-            workload_comp_comm_order[device_id].append(workload)
-            workload_comp_comm_order[device_id].extend(comm_ops[device_id][idx+1])
     # workload_comp_comm_order: Dict[int, List[Dict]] = {}
     # # initialize with existing compute workloads
     # for device_id, workloads in workload_exe_order.items():
     #     workload_comp_comm_order[device_id] = []
-    #     workload_comp_comm_order[device_id].extend(sorted(comm_ops[device_id][0], key=lambda x : x['start_time']))
+    #     workload_comp_comm_order[device_id].extend(comm_ops[device_id][0])
     #     for idx, workload in enumerate(workloads):
     #         workload_comp_comm_order[device_id].append(workload)
-    #         workload_comp_comm_order[device_id].extend(sorted(comm_ops[device_id][idx+1], key=lambda x : x['start_time']))
+    #         workload_comp_comm_order[device_id].extend(comm_ops[device_id][idx+1])
+    workload_comp_comm_order: Dict[int, List[Dict]] = {}
+    # initialize with existing compute workloads
+    for device_id, workloads in workload_exe_order.items():
+        workload_comp_comm_order[device_id] = []
+        workload_comp_comm_order[device_id].extend(sorted(comm_ops[device_id][0], key=lambda x : x['start_time']))
+        for idx, workload in enumerate(workloads):
+            workload_comp_comm_order[device_id].append(workload)
+            workload_comp_comm_order[device_id].extend(sorted(comm_ops[device_id][idx+1], key=lambda x : x['start_time']))
     # print_ops(workload_comp_comm_order=workload_comp_comm_order, skip_comp=False)
     return workload_comp_comm_order
             
@@ -863,6 +863,7 @@ def get_octopipe_config(partition_path, placement_path, results_path):
     partition = read_partition_from_file(partition_path)
     placement = read_placement_from_file(placement_path)
     scheduling = read_scheduling_from_file(results_path)
+    layer_idx_offset = [sum(partition[0:i]) for i in range(len(partition)+1)]  # Assuming layer index offset is based on the first stage
 
     stage_device_mapping, device_stage_mapping = build_stage_device_mappings(
         partition,
@@ -890,6 +891,7 @@ def get_octopipe_config(partition_path, placement_path, results_path):
         "comp_workloads": workload_exe_order,
         "workloads": workload_comp_comm_order,
         "layout": layout,
+        "layer_idx_offset": layer_idx_offset,
     }
     # print_ops(res["workloads"], skip_comp=False, num=30)
     # delay_send_for_overlap(res=res)
@@ -1008,7 +1010,7 @@ if __name__ == "__main__":
     import os
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/multi_chunk")
-    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
+    # DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
 
     partition_path = os.path.join(DEBUG_CONFIG_DIR, "partition.txt")
     placement_path = os.path.join(DEBUG_CONFIG_DIR, "placement.txt")
@@ -1017,6 +1019,7 @@ if __name__ == "__main__":
     res = get_octopipe_config(partition_path=partition_path,placement_path=placement_path,results_path=results_path)
     print(res["sid->did"])
     print(res["did->sid"])
+    print(res["layer_idx_offset"])
     # print(res["workloads"][0][:10])
     # print_ops(res['workloads'], skip_comp=False,num=20, s=70)
     # print_ops(res['workloads'], s_sid=[6, 14, 22, 30, 7, 15, 23, 31], r_sid=[6, 14, 22, 30, 7, 15, 23, 31], num=90)

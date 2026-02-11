@@ -306,3 +306,23 @@ def destroy_global_vars():
 
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
+
+def get_octopipe_config():
+    """Return octopipe config."""
+    args = get_args()
+    if not hasattr(args, 'octopipe'):
+        return None
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+    octopipe_config_dir = os.path.join(project_root, "octopipe", args.octopipe_config_dir)
+    partition_path = os.path.join(octopipe_config_dir, "partition.txt")
+    placement_path = os.path.join(octopipe_config_dir, "placement.txt")
+    results_path = os.path.join(octopipe_config_dir, "result.txt")
+
+    from octopipe.generate_inst import get_octopipe_config as goc
+    octopipe_config = goc(
+        partition_path=partition_path,
+        placement_path=placement_path,
+        results_path=results_path,
+    )
+    return octopipe_config

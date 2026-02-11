@@ -278,6 +278,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.layer_number = layer_number + get_transformer_layer_offset(
             self.config, vp_stage, get_pg_rank(pg_collection.pp)
         )
+        from megatron.training import get_args
+        args = get_args()
+        if args.octopipe:
+            self.layer_number = layer_number
+            
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
