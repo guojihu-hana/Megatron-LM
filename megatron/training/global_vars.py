@@ -307,6 +307,11 @@ def destroy_global_vars():
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
 
+def octopipe_enabled():
+    """Return true if octopipe is enabled."""
+    args = get_args()
+    return hasattr(args, 'octopipe') and args.octopipe
+
 def get_octopipe_config():
     """Return octopipe config."""
     args = get_args()

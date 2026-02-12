@@ -23,6 +23,7 @@ from megatron.training.utils import (
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
+    is_octopipe_first_or_last_pipeline_stage,
 )
 from model_provider import model_provider
 
@@ -40,8 +41,12 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage):
-        return None, None, None, None, None
+    if get_args().octopipe:
+        if not is_octopipe_first_or_last_pipeline_stage(vp_stage):
+            return None, None, None, None, None
+    else:
+        if not is_first_or_last_pipeline_stage(vp_stage):
+            return None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
@@ -139,6 +144,8 @@ def forward_step(data_iterator, model: MambaModel):
 
 
 def is_dataset_built_on_rank(vp_stage=None):
+    if get_args().octopipe:
+        return is_octopipe_first_or_last_pipeline_stage(vp_stage) and mpu.get_tensor_model_parallel_rank() == 0
     return is_first_or_last_pipeline_stage(vp_stage) and mpu.get_tensor_model_parallel_rank() == 0
 
 

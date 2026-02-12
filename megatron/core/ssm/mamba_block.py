@@ -28,7 +28,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor, get_pg_rank
-from megatron.training.global_vars import get_args, get_octopipe_config
+from megatron.training.global_vars import get_octopipe_config, octopipe_enabled
 
 @dataclass
 class MambaStackSubmodules:
@@ -111,51 +111,48 @@ class MambaStack(MegatronModule):
             self.hybrid_override_pattern,
         )
 
-        self.layers = nn.ModuleList()    
-        args = get_args()
-        if args.octopipe:
+        self.layers = nn.ModuleList()
+        if octopipe_enabled():
             octopipe_config = get_octopipe_config()
+            assert vp_stage is not None, "vp_stage should be set when octopipe_config is provided"
             layer_idx_offset = octopipe_config['layer_idx_offset']
-            pp_rank = get_pg_rank(self.pp_group)
-            sids = octopipe_config['did->sid'][pp_rank]
-            for sid in sids:
-                layer_idx_start = layer_idx_offset[sid]
-                layer_idx_end = layer_idx_offset[sid + 1]
-                for i, layer_type in enumerate(self.layer_type_list[layer_idx_start:layer_idx_end]):
-                    if layer_type == LayerSymbols.MAMBA:
-                        layer = build_module(
-                            submodules.mamba_layer,
-                            config=self.config,
-                            residual_in_fp32=residual_in_fp32,
-                            layer_number=i + 1 + layer_idx_start,
-                            pp_layer_offset=layer_idx_start,
-                            pg_collection=pg_collection,
-                            vp_stage=self.vp_stage,
-                        )
-                    elif layer_type == LayerSymbols.ATTENTION:
-                        layer = build_module(
-                            submodules.attention_layer,
-                            config=self.config,
-                            layer_number=i + 1 + layer_idx_start,
-                            pg_collection=pg_collection,
-                            vp_stage=self.vp_stage,
-                        )
-                    elif layer_type == LayerSymbols.MLP:
-                        layer = build_module(
-                            submodules.mlp_layer,
-                            config=self.config,
-                            layer_number=i + 1 + layer_idx_start,
-                            pg_collection=pg_collection,
-                            vp_stage=self.vp_stage,
-                        )
-                    elif layer_type == LayerSymbols.MOE:
-                        layer = build_module(
-                            submodules.moe_layer, config=self.config, layer_number=i + 1 + layer_idx_start,
-                            vp_stage=self.vp_stage,
-                        )
-                    else:
-                        assert False, "unexpected layer_type"
-                    self.layers.append(layer)
+            layer_idx_start = layer_idx_offset[vp_stage]
+            layer_idx_end = layer_idx_offset[vp_stage + 1]
+            for i, layer_type in enumerate(self.layer_type_list[layer_idx_start:layer_idx_end]):
+                if layer_type == LayerSymbols.MAMBA:
+                    layer = build_module(
+                        submodules.mamba_layer,
+                        config=self.config,
+                        residual_in_fp32=residual_in_fp32,
+                        layer_number=i + 1 + layer_idx_start,
+                        pp_layer_offset=layer_idx_start,
+                        pg_collection=pg_collection,
+                        vp_stage=self.vp_stage,
+                    )
+                elif layer_type == LayerSymbols.ATTENTION:
+                    layer = build_module(
+                        submodules.attention_layer,
+                        config=self.config,
+                        layer_number=i + 1 + layer_idx_start,
+                        pg_collection=pg_collection,
+                        vp_stage=self.vp_stage,
+                    )
+                elif layer_type == LayerSymbols.MLP:
+                    layer = build_module(
+                        submodules.mlp_layer,
+                        config=self.config,
+                        layer_number=i + 1 + layer_idx_start,
+                        pg_collection=pg_collection,
+                        vp_stage=self.vp_stage,
+                    )
+                elif layer_type == LayerSymbols.MOE:
+                    layer = build_module(
+                        submodules.moe_layer, config=self.config, layer_number=i + 1 + layer_idx_start,
+                        vp_stage=self.vp_stage,
+                    )
+                else:
+                    assert False, "unexpected layer_type"
+                self.layers.append(layer)
         else:
             pp_layer_offset = 0
             if self.pp_group.size() > 1:

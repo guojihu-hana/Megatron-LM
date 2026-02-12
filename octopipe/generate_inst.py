@@ -865,6 +865,9 @@ def get_octopipe_config(partition_path, placement_path, results_path):
     scheduling = read_scheduling_from_file(results_path)
     layer_idx_offset = [sum(partition[0:i]) for i in range(len(partition)+1)]  # Assuming layer index offset is based on the first stage
 
+    assert len(partition) == sum([len(stages) for stages in placement]), "Total number of stages in placement must match length of partition"
+    assert set().union(*placement) == set(range(len(partition))), "All stages must be placed exactly once in placement"
+
     stage_device_mapping, device_stage_mapping = build_stage_device_mappings(
         partition,
         placement,
@@ -884,6 +887,13 @@ def get_octopipe_config(partition_path, placement_path, results_path):
     
     layout = generate_pipeline_layout(partition=partition, placement=placement)
 
+    stage_num = len(partition)
+    max_chunk_num = max([len(sids) for sids in device_stage_mapping.values()])
+    padded_device_stage_mapping = {
+        key: value + [-1] * (max_chunk_num - len(value))
+        for key, value in device_stage_mapping.items()
+    }
+
     res = {
         "sid->did": stage_device_mapping,
         "did->sid": device_stage_mapping,
@@ -892,15 +902,11 @@ def get_octopipe_config(partition_path, placement_path, results_path):
         "workloads": workload_comp_comm_order,
         "layout": layout,
         "layer_idx_offset": layer_idx_offset,
+        "stage_num": stage_num,
+        "max_chunk_num": max_chunk_num,
+        "did->padded_sids": padded_device_stage_mapping
     }
-    # print_ops(res["workloads"], skip_comp=False, num=30)
-    # delay_send_for_overlap(res=res)
-    # reorder_send_recv_pairs(res=res)
-    # advance_recv_for_overlap(res=res)
-    # reorder_send_recv_pairs(res=res)
-    # reorder_cross_comm_pairs(res=res)
-    # print_ops(res["workloads"], skip_comp=False)
-    # print_ops(res["workloads"], s_sid=[6,7], r_sid=[6,7], num=50)
+
     return res
 
 def print_ops(workload_comp_comm_order, skip_comp=True, s_sid:list=[], r_sid:list=[], num:int=20, s:int=0):
@@ -1009,7 +1015,7 @@ def Pipeline_Schedule_of_1F1B(nmb_warmup, nmb_remaining):
 if __name__ == "__main__":
     import os
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/multi_chunk")
+    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/asymmetric_multi_chunk")
     # DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
 
     partition_path = os.path.join(DEBUG_CONFIG_DIR, "partition.txt")
@@ -1019,7 +1025,10 @@ if __name__ == "__main__":
     res = get_octopipe_config(partition_path=partition_path,placement_path=placement_path,results_path=results_path)
     print(res["sid->did"])
     print(res["did->sid"])
+    print(res["sid->cid"])
     print(res["layer_idx_offset"])
+    print(res["max_chunk_num"])
+    print(res["did->padded_sids"])
     # print(res["workloads"][0][:10])
     # print_ops(res['workloads'], skip_comp=False,num=20, s=70)
     # print_ops(res['workloads'], s_sid=[6, 14, 22, 30, 7, 15, 23, 31], r_sid=[6, 14, 22, 30, 7, 15, 23, 31], num=90)

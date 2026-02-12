@@ -280,7 +280,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         from megatron.training import get_args
         args = get_args()
-        if args.octopipe:
+        if args.octopipe and args.is_hybrid_model:
             self.layer_number = layer_number
             
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout

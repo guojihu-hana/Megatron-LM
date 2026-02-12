@@ -65,6 +65,8 @@ from megatron.core.pipeline_parallel.utils import (
     is_pp_last_stage,
     is_vp_first_stage,
     is_vp_last_stage,
+    is_octopipe_first_stage,
+    is_octopipe_last_stage,
 )
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
@@ -829,7 +831,28 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
+    if args.octopipe:
+        train_data_iterator = []
+        valid_data_iterator = []
+        test_data_iterator = []
+        octopipe_config = get_octopipe_config()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        sids = octopipe_config['did->padded_sids'][pp_rank]
+        for sid in sids:
+            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+            assert "vp_stage" in dataset_provider_parameters, \
+                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+            vp_stage_train_valid_test_dataset_provider = \
+                functools.partial(train_valid_test_dataset_provider, vp_stage=sid)
+            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                vp_stage_train_valid_test_dataset_provider.is_distributed = True
+            iterators = build_train_valid_test_data_iterators(
+                vp_stage_train_valid_test_dataset_provider
+            )
+            train_data_iterator.append(iterators[0])
+            valid_data_iterator.append(iterators[1])
+            test_data_iterator.append(iterators[2])
+    elif args.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
@@ -1070,6 +1093,23 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 )
                 this_model.model_type = model_type
                 this_model.vp_stage = i
+                model.append(this_model)
+        elif args.octopipe:
+            model = []
+            octopipe_config = get_octopipe_config()
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            sids = octopipe_config['did->sid'][pp_rank]
+            for sid in sids:
+                pre_process = is_octopipe_first_stage(sid)
+                post_process = is_octopipe_last_stage(sid)
+                this_model = model_provider_func(
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    vp_stage=sid,
+                    config=config,
+                    pg_collection=pg_collection,
+                )
+                this_model.model_type = model_type
                 model.append(this_model)
         else:
             pre_process = is_pp_first_stage(pg_collection.pp)

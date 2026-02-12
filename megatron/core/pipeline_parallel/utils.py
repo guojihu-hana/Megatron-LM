@@ -9,6 +9,14 @@ from torch.autograd import Variable
 
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
 
+def is_octopipe_first_stage(octopipe_stage_idx: int):
+    return octopipe_stage_idx == 0
+
+def is_octopipe_last_stage(octopipe_stage_idx: int):
+    from megatron.training.global_vars import get_octopipe_config
+    octopipe_config = get_octopipe_config()
+    stage_num = octopipe_config["stage_num"]
+    return octopipe_stage_idx == stage_num - 1
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""

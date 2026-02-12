@@ -32,6 +32,7 @@ except ImportError:
         )
 
 from megatron.training import get_args, get_timers, get_adlr_autoresume
+from megatron.core.pipeline_parallel.utils import is_octopipe_first_stage, is_octopipe_last_stage
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -427,6 +428,11 @@ def print_rank_last(message):
     else:
         print(message, flush=True)
 
+def is_octopipe_first_or_last_pipeline_stage(octopipe_stage_idx):
+    return (
+        is_octopipe_first_stage(octopipe_stage_idx)
+        or is_octopipe_last_stage(octopipe_stage_idx)
+    )
 
 def is_first_or_last_pipeline_stage(vp_stage):
     """Return True if on first or last pipeline stage, taking into account virtual
