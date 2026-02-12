@@ -184,6 +184,9 @@ class P2PCommunicator:
             else None
         )
 
+    def _get_global_rank(self, pp_rank: int) -> int:
+        return dist.get_global_rank(self.pp_group, pp_rank)
+
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
         tensor shapes before the actual tensor communication happens.
