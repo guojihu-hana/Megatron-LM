@@ -198,6 +198,12 @@ def get_num_layers_to_build(
         if is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
             num_layers_to_build -= 1
             assert num_layers_to_build >= 0, f"Not enough layers in the last virtual pipeline stage"
+    
+    from megatron.training.global_vars import octopipe_enabled, get_octopipe_config
+    if octopipe_enabled():
+        octopipe_config = get_octopipe_config()
+        partition = octopipe_config["partition"]
+        num_layers_to_build = partition[vp_stage]
 
     return num_layers_to_build
 

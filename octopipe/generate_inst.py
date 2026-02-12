@@ -904,7 +904,8 @@ def get_octopipe_config(partition_path, placement_path, results_path):
         "layer_idx_offset": layer_idx_offset,
         "stage_num": stage_num,
         "max_chunk_num": max_chunk_num,
-        "did->padded_sids": padded_device_stage_mapping
+        "did->padded_sids": padded_device_stage_mapping,
+        "partition": partition,
     }
 
     return res

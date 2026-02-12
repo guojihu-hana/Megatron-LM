@@ -45,6 +45,13 @@ def get_transformer_layer_offset(
 
     if config.pipeline_model_parallel_size > 1:
 
+        from megatron.training.global_vars import octopipe_enabled, get_octopipe_config
+        if octopipe_enabled():
+            octopipe_config = get_octopipe_config()
+            layer_idx_offset = octopipe_config["layer_idx_offset"]
+            offset = layer_idx_offset[vp_stage]
+            return offset
+
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(
                 layer_type=LayerType.decoder, vp_stage=vp_stage
