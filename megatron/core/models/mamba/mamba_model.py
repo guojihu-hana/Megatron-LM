@@ -16,7 +16,7 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.utils import WrappedTensor, deprecate_inference_params, get_pg_size
 
 
 class MambaModel(LanguageModule):
@@ -133,10 +133,15 @@ class MambaModel(LanguageModule):
         )
 
         # Output
-        if post_process:
+        if post_process or self.config.pp_output_parallel:
+            if self.config.pp_output_parallel:
+                pp_shard = get_pg_size(self.pg_collection.pp)
+                out_features = self.vocab_size // pp_shard
+            else:
+                out_features = self.vocab_size
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                self.vocab_size,
+                out_features,
                 config=config,
                 init_method=config.init_method,
                 bias=False,
@@ -147,7 +152,7 @@ class MambaModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process:
+        if self.pre_process or self.post_process or self.config.pp_output_parallel:
             self.setup_embeddings_and_output_layer()
 
         for name, module in self.named_modules():

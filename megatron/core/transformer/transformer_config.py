@@ -736,6 +736,13 @@ class TransformerConfig(ModelParallelConfig):
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
 
+
+    pp_output_parallel: bool = False
+    """When True, shard the final output (LM head) across all PP ranks for training.
+    Each PP rank computes its local logits shard and participates in backward for the
+    head; the final hidden-to-backbone gradient is reduced across PP and only the last
+    PP rank continues the rest of the backward graph."""
+
     inference_fuse_tp_communication: bool = False
     """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
 

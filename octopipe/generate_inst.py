@@ -485,12 +485,14 @@ def read_scheduling_from_file(file_path: str) -> List[Dict]:
                 raise ValueError(f"Invalid scheduling line: {line}") from e
 
             parts = op_token.split("_")
-            if len(parts) != 3:
-                raise ValueError(f"Invalid op format: {op_token}")
 
             op_type = parts[0]
             mid = int(parts[1])
             sid = int(parts[2])
+            if len(parts) > 3:
+                did = int(parts[3])
+            else:
+                did = 0
 
             scheduling.append(
                 {
@@ -498,6 +500,7 @@ def read_scheduling_from_file(file_path: str) -> List[Dict]:
                     "type": op_type,
                     "mid": mid,
                     "sid": sid,
+                    "did": did,
                     "start_time": float(start_str),
                     "end_time": float(end_str),
                 }
@@ -767,9 +770,8 @@ def overlap_aware_comm_insert(
     stage_device_mapping: Dict[int, int],
 ) -> Dict[int, List[Dict]]:
 
-    comm_ops = []
+    comm_ops = [[] for _ in range(len(workload_exe_order))]
     for did, workloads in workload_exe_order.items():
-        comm_ops.append([])
         for workload in workloads:
             comm_ops[did].append([])
         comm_ops[did].append([])
@@ -835,17 +837,13 @@ def overlap_aware_comm_insert(
                 comm_ops[did][send_idx].append(send_op)
                 comm_ops[recver_did][recv_idx].append(recv_op)
 
-    # print(comm_ops)
-    # workload_comp_comm_order: Dict[int, List[Dict]] = {}
-    # # initialize with existing compute workloads
+    workload_comp_comm_order: Dict[int, List[Dict]] = {}
     # for device_id, workloads in workload_exe_order.items():
     #     workload_comp_comm_order[device_id] = []
     #     workload_comp_comm_order[device_id].extend(comm_ops[device_id][0])
     #     for idx, workload in enumerate(workloads):
     #         workload_comp_comm_order[device_id].append(workload)
     #         workload_comp_comm_order[device_id].extend(comm_ops[device_id][idx+1])
-    workload_comp_comm_order: Dict[int, List[Dict]] = {}
-    # initialize with existing compute workloads
     for device_id, workloads in workload_exe_order.items():
         workload_comp_comm_order[device_id] = []
         workload_comp_comm_order[device_id].extend(sorted(comm_ops[device_id][0], key=lambda x : x['start_time']))
@@ -976,48 +974,112 @@ def print_ops(workload_comp_comm_order, skip_comp=True, s_sid:list=[], r_sid:lis
                 print(f"{color}{idx+s} {output:<{width}}{COLOR_RESET}", end="")
         print()
 
-def recv_forward():
+def recv_fwd():
     pass
-def forward_step():
+def fwd_step():
     pass
-def send_forward():
+def send_fwd():
     pass
-def recv_backward():
+def recv_bwd():
     pass
-def backward_step():
+def bwd_step():
     pass
-def send_backward():
+def send_bwd():
     pass
-def send_forward_recv_backward():
+def send_fwd_recv_bwd():
     pass
-def send_backward_recv_forward():
+def send_bwd_recv_fwd():
+    pass
+def send_fwd_recv_fwd():
+    pass
+def send_bwd_recv_bwd():
     pass
 
-def Pipeline_Schedule_of_1F1B(nmb_warmup, nmb_remaining):
-    # Run warmup forward passes.
+def recv():
+    pass
+def send():
+    pass
+
+def wait_and_recv():
+    pass
+
+class Node:
+    def __init__(self, comp=False, send=False, recv=False):
+        self.type = 'comp' if comp else 'send' if send else 'recv'
+        self.data_not_ready = True if self.type == 'fwd' or self.type == 'bwd' else False
+
+class Graph:
+    def __init__(self, nodes:List[Node], pp_size:int):
+        self.nodes = nodes
+        self.pp_size = pp_size
+    def sub_graph(self, pp_rank:int) -> List[Node]:
+        return self.nodes[pp_rank*len(self.nodes)//self.pp_size:(pp_rank+1)*len(self.nodes)//self.pp_size]
+
+
+def OctoPipe_Executor(graph:Graph, pp_rank:int):
+    sub_graph = graph.sub_graph(pp_rank)
+    # Unified execution workflow
+    for node in sub_graph:
+        if node.type == 'comp':
+            if node.data_not_ready:
+                wait_and_recv()
+            if node.type == 'fwd':
+                fwd_step() # Comp.
+            elif node.type == 'bwd':
+                bwd_step() # Comp.
+        elif node.type == 'send':
+            send() # Comm.
+        elif node.type == 'recv':
+            recv() # Comm.
+
+def OneFOneB_Executor():
+    # Run warmup phase.
+    for mb in range(warmup):
+        recv_fwd() # Comm.
+        fwd_step() # Comp.
+        send_fwd() # Comm.
+
+    # Run steady phase.
+    for mb in range(steady):
+        fwd_step() # Comp.
+        send_fwd_recv_bwd() # Comm.
+        bwd_step() # Comp.
+        send_bwd_recv_fwd() # Comm.
+
+    # Run cooldown phase.
+    for mb in range(cooldown):
+        recv_bwd() # Comm.
+        bwd_step() # Comp.
+        send_bwd() # Comm.
+
+def Interleaved_1F1B_Executor():
+    # Run warmup forward phase.
+    for i in range():
+        recv_fwd_sync() # Comm.
+        fwd_step() # Comp.
+        send_fwd_recv_fwd() # Comm.
+
+    # Run steady phase.
+    for i in range():
+        recv_fwd_sync() # Comm.
+        fwd_step() # Comp.
+        send_fwd_recv_fwd() # Comm.
+        recv_bwd_sync() # Comm.
+        bwd_step() # Comp.
+        send_bwd_recv_bwd() # Comm.
+
+    # Run cooldown phase.
     for i in range(nmb_warmup):
-        recv_forward() # 通信
-        forward_step() # 计算
-        send_forward() # 通信
+        recv_bwd_sync() # Comm.
+        bwd_step() # Comp.
+        send_bwd_recv_bwd() # Comm.
 
-    # Run 1F1B in steady state.
-    for i in range(nmb_remaining):
-        forward_step() # 计算
-        send_forward_recv_backward() # 通信
-        backward_step() # 计算
-        send_backward_recv_forward() # 通信
-
-    # Run cooldown backward passes.
-    for i in range(nmb_warmup):
-        recv_backward() # 通信
-        backward_step() # 计算
-        send_backward() # 通信
-    
 if __name__ == "__main__":
     import os
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/asymmetric_multi_chunk")
     # DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
+    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/deepseek")
 
     partition_path = os.path.join(DEBUG_CONFIG_DIR, "partition.txt")
     placement_path = os.path.join(DEBUG_CONFIG_DIR, "placement.txt")
@@ -1029,6 +1091,7 @@ if __name__ == "__main__":
     print(res["sid->cid"])
     print(res["layer_idx_offset"])
     print(res["max_chunk_num"])
+    print(res["stage_num"])
     print(res["did->padded_sids"])
     # print(res["workloads"][0][:10])
     # print_ops(res['workloads'], skip_comp=False,num=20, s=70)

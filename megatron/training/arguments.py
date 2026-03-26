@@ -2628,6 +2628,15 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument(
+        '--pp-output-parallel',
+        action='store_true',
+        default=False,
+        dest='pp_output_parallel',
+        help=(
+            'Shard the LM head across TP*PP for training. '
+        ),
+    )
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '
