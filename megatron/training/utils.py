@@ -640,6 +640,52 @@ def get_batch_on_this_tp_rank(data_iterator):
     return batch
 
 
+def broadcast_labels_loss_mask_for_tp_if_needed(labels, loss_mask, is_last_stage: bool):
+    """Synchronize labels/loss_mask across tensor-parallel ranks when computing loss on first PP.
+
+    Tensor-parallel ranks > 0 on Megatron *first* PP stage get ``labels``/``loss_mask`` = None from
+    :func:`get_batch_on_this_tp_rank` (embedding-only path). OctoPipe can place the logical last
+    stage (loss) on the same PP rank as the first stage; then ``is_last_stage`` is True while the
+    Megatron PP rank is still first, and TP ranks > 0 need ``labels``/``loss_mask`` from the TP
+    source rank before ``loss_func`` runs.
+
+    Megatron *last* PP already broadcasts labels/loss_mask to all TP ranks in
+    :func:`get_batch_on_this_tp_rank`. All TP ranks must participate in the same collectives.
+    """
+    if not is_last_stage:
+        return labels, loss_mask
+    tp_world = mpu.get_tensor_model_parallel_world_size()
+    if tp_world <= 1:
+        return labels, loss_mask
+    if mpu.is_pipeline_last_stage():
+        return labels, loss_mask
+    if not mpu.is_pipeline_first_stage():
+        return labels, loss_mask
+    args = get_args()
+    tp_group = mpu.get_tensor_model_parallel_group()
+    tp_src = mpu.get_tensor_model_parallel_src_rank()
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        assert labels is not None and loss_mask is not None, (
+            "is_last_stage on first PP stage requires labels and loss_mask on tensor-parallel src rank"
+        )
+        torch.distributed.broadcast(labels, src=tp_src, group=tp_group)
+        torch.distributed.broadcast(loss_mask, src=tp_src, group=tp_group)
+    else:
+        labels = torch.empty(
+            (args.micro_batch_size, args.seq_length),
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        loss_mask = torch.empty(
+            (args.micro_batch_size, args.seq_length),
+            dtype=torch.float32,
+            device=torch.cuda.current_device(),
+        )
+        torch.distributed.broadcast(labels, src=tp_src, group=tp_group)
+        torch.distributed.broadcast(loss_mask, src=tp_src, group=tp_group)
+    return labels, loss_mask
+
+
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
 

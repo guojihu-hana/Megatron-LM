@@ -19,6 +19,7 @@ from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
+    broadcast_labels_loss_mask_for_tp_if_needed,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
@@ -118,12 +119,15 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: MambaModel):
+def forward_step(data_iterator, model: MambaModel, is_last_stage: bool = True):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
-        model (MambaModel): The GPT Model
+        model (MambaModel): The Mamba model
+        is_last_stage (bool): Whether this forward computes the loss (pipeline last stage). OctoPipe
+            passes False for non-final stages; when True with TP>1, labels/loss_mask are broadcast
+            within the TP group on first PP when needed (see ``broadcast_labels_loss_mask_for_tp_if_needed``).
     """
     timers = get_timers()
 
@@ -133,6 +137,9 @@ def forward_step(data_iterator, model: MambaModel):
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
+        labels, loss_mask = broadcast_labels_loss_mask_for_tp_if_needed(
+            labels, loss_mask, is_last_stage
+        )
     timers('batch-generator').stop()
 
     with stimer:

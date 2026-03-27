@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -906,3 +906,487 @@ class P2PCommunicator:
         if config.timers is not None:
             config.timers('forward-backward-send-forward-backward-recv').stop()
         return input_tensor, output_tensor_grad
+
+
+class NvshmemP2PCommunicator:
+    """NVSHMEM symmetric-memory P2P for pipeline stages (1F1B and OctoPipe).
+
+    OctoPipe uses ``send_tensor_async`` / ``recv_tensor_async`` with peer ranks given as
+    **global ranks in the PP process group** (same convention as ``P2PCommunicator``).
+    Internally, peers are mapped to NVSHMEM PE indices ``0 .. pp_size-1``.
+
+    Enabled via ``MEGATRON_NVSHMEM_P2P=1``; default NCCL path is unchanged when unset.
+    """
+
+    def __init__(self, pp_group, config: object):
+        self.pp_group = pp_group
+        self.config = config
+        self._rank = pp_group.rank()
+        self._world = pp_group.size()
+        self._pp_global_ranks = [
+            torch.distributed.get_global_rank(pp_group, i) for i in range(self._world)
+        ]
+        self._global_to_pp = {g: i for i, g in enumerate(self._pp_global_ranks)}
+        # NVSHMEM is initialized with rank in [0, pp_size) and nranks == pp_size only.
+        # remote_pe in put/get must be a PE index in that same space, NOT a global torch rank.
+        # Use linear neighbors (no wrap-around ring).
+        self._next_pe = self._rank + 1 if self._rank + 1 < self._world else None
+        self._prev_pe = self._rank - 1 if self._rank - 1 >= 0 else None
+        self._mailboxes = {}
+        self._shape_initialized = set()
+        self._stream = None
+        self._nv = None
+        # Per-shape ready sequence ids (pure NVSHMEM handshake, no NCCL send/recv).
+        self._send_fwd_seq = {}
+        self._send_bwd_seq = {}
+        self._recv_fwd_seq = {}
+        self._recv_bwd_seq = {}
+        self._send_peer_seq = {}
+        self._recv_peer_seq = {}
+        self._local_peer_queues = {}
+        self._init_nvshmem()
+
+    def _init_nvshmem(self):
+        import nvshmem.core as nvshmem_core
+        from cuda.core.experimental import Device
+
+        os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        dev = Device(local_rank)
+        dev.set_current()
+        self._stream = nvshmem_core.NvshmemStream(torch.cuda.current_stream())
+
+        uid = nvshmem_core.get_unique_id(empty=self._rank != 0)
+        objs = [None] * self._world
+        torch.distributed.all_gather_object(objs, uid, group=self.pp_group)
+        nvshmem_core.init(
+            device=dev,
+            uid=objs[0],
+            rank=self._rank,
+            nranks=self._world,
+            initializer_method="uid",
+        )
+        self._nv = nvshmem_core
+        torch.distributed.barrier(group=self.pp_group)
+
+    def _shape_key(self, tensor_shape: Shape):
+        shape = tuple(tensor_shape) if isinstance(tensor_shape, (list, tuple, torch.Size)) else (tensor_shape,)
+        return (shape, str(self.config.pipeline_dtype))
+
+    def _ensure_mailboxes_for_shape(self, tensor_shape: Shape):
+        """Allocate all channel mailboxes for a shape in a synchronized order.
+
+        NVSHMEM symmetric allocations must be consistent across all PEs. Lazy per-branch
+        allocations can diverge across ranks and deadlock/hang. We allocate all channels
+        together once per shape with PP-group barriers.
+        """
+        shape = tuple(tensor_shape) if isinstance(tensor_shape, (list, tuple, torch.Size)) else (tensor_shape,)
+        key = (shape, str(self.config.pipeline_dtype))
+        if key in self._shape_initialized:
+            return
+        torch.distributed.barrier(group=self.pp_group)
+        for channel in (
+            "fwd",
+            "bwd",
+            "tmp_send_fwd",
+            "tmp_send_bwd",
+            "fwd_ready",
+            "bwd_ready",
+            "tmp_fwd_ready",
+            "tmp_bwd_ready",
+        ):
+            mkey = (channel, shape, str(self.config.pipeline_dtype))
+            if mkey not in self._mailboxes:
+                if "ready" in channel:
+                    # Sequence-number handshake flags are int32 scalars.
+                    t = self._nv.tensor((1,), dtype=torch.int32)
+                    t.zero_()
+                    self._mailboxes[mkey] = t
+                else:
+                    self._mailboxes[mkey] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
+
+        # Allocate point-to-point channels for arbitrary PP-rank communication
+        # used by OctoPipe send_tensor_async/recv_tensor_async.
+        for src in range(self._world):
+            for dst in range(self._world):
+                if src == dst:
+                    continue
+                for channel in (
+                    f"peer_data_{src}_{dst}",
+                    f"peer_tmp_data_{src}_{dst}",
+                    f"peer_ready_{src}_{dst}",
+                    f"peer_tmp_ready_{src}_{dst}",
+                ):
+                    mkey = (channel, shape, str(self.config.pipeline_dtype))
+                    if mkey not in self._mailboxes:
+                        if "ready" in channel:
+                            t = self._nv.tensor((1,), dtype=torch.int32)
+                            t.zero_()
+                            self._mailboxes[mkey] = t
+                        else:
+                            self._mailboxes[mkey] = self._nv.tensor(
+                                shape, dtype=self.config.pipeline_dtype
+                            )
+        torch.distributed.barrier(group=self.pp_group)
+        self._shape_initialized.add(key)
+
+    def _get_mailbox(self, tensor_shape: Shape, channel: str):
+        self._ensure_mailboxes_for_shape(tensor_shape)
+        key = (channel,) + self._shape_key(tensor_shape)
+        if key not in self._mailboxes:
+            shape = key[1]
+            self._mailboxes[key] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
+        return self._mailboxes[key]
+
+    def _communicate(self, tensor_send_next, tensor_send_prev, recv_prev: bool, recv_next: bool, tensor_shape: Shape):
+        shape_key = self._shape_key(tensor_shape)
+        # Write phase
+        if tensor_send_next is not None:
+            assert self._next_pe is not None
+            send_src = self._get_mailbox(tensor_send_next.shape, "tmp_send_fwd")
+            send_src.copy_(tensor_send_next)
+            dst = self._get_mailbox(tensor_send_next.shape, "fwd")
+            self._nv.put(dst=dst, src=send_src, remote_pe=self._next_pe, stream=self._stream)
+            self._nv.quiet(stream=self._stream)
+            # NVSHMEM-only ready handshake: write sequence id to receiver's ready flag.
+            seq = self._send_fwd_seq.get(shape_key, 0) + 1
+            self._send_fwd_seq[shape_key] = seq
+            ready_src = self._get_mailbox(tensor_send_next.shape, "tmp_fwd_ready")
+            ready_src.fill_(seq)
+            ready_dst = self._get_mailbox(tensor_send_next.shape, "fwd_ready")
+            self._nv.put(dst=ready_dst, src=ready_src, remote_pe=self._next_pe, stream=self._stream)
+            self._nv.quiet(stream=self._stream)
+        if tensor_send_prev is not None:
+            assert self._prev_pe is not None
+            send_src = self._get_mailbox(tensor_send_prev.shape, "tmp_send_bwd")
+            send_src.copy_(tensor_send_prev)
+            dst = self._get_mailbox(tensor_send_prev.shape, "bwd")
+            self._nv.put(dst=dst, src=send_src, remote_pe=self._prev_pe, stream=self._stream)
+            self._nv.quiet(stream=self._stream)
+            # NVSHMEM-only ready handshake: write sequence id to receiver's ready flag.
+            seq = self._send_bwd_seq.get(shape_key, 0) + 1
+            self._send_bwd_seq[shape_key] = seq
+            ready_src = self._get_mailbox(tensor_send_prev.shape, "tmp_bwd_ready")
+            ready_src.fill_(seq)
+            ready_dst = self._get_mailbox(tensor_send_prev.shape, "bwd_ready")
+            self._nv.put(dst=ready_dst, src=ready_src, remote_pe=self._prev_pe, stream=self._stream)
+            self._nv.quiet(stream=self._stream)
+
+        tensor_recv_prev = None
+        tensor_recv_next = None
+        if recv_prev:
+            expected = self._recv_fwd_seq.get(shape_key, 0) + 1
+            ready_local = self._get_mailbox(tensor_shape, "fwd_ready")
+            # Busy-wait on local symmetric flag; peer updates it with nvshmem.put.
+            while int(ready_local.item()) < expected:
+                pass
+            self._recv_fwd_seq[shape_key] = expected
+            local = self._get_mailbox(tensor_shape, "fwd")
+            tensor_recv_prev = local.clone().requires_grad_(True)
+        if recv_next:
+            expected = self._recv_bwd_seq.get(shape_key, 0) + 1
+            ready_local = self._get_mailbox(tensor_shape, "bwd_ready")
+            # Busy-wait on local symmetric flag; peer updates it with nvshmem.put.
+            while int(ready_local.item()) < expected:
+                pass
+            self._recv_bwd_seq[shape_key] = expected
+            local = self._get_mailbox(tensor_shape, "bwd")
+            tensor_recv_next = local.clone().requires_grad_(True)
+        return tensor_recv_prev, tensor_recv_next, None
+
+    class _NvshmemDoneHandle:
+        def wait(self):
+            return None
+
+    class _NvshmemPeerRecvHandle:
+        """Deferred NVSHMEM peer recv — matches NCCL ``irecv`` + ``wait()`` semantics for OctoPipe."""
+
+        __slots__ = ("_comm", "_out", "_shape", "_src_pe", "_done")
+
+        def __init__(self, comm, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int):
+            self._comm = comm
+            self._out = out
+            self._shape = tensor_shape
+            self._src_pe = src_group_rank
+            self._done = False
+
+        def wait(self):
+            if self._done:
+                return None
+            self._comm._recv_peer_tensor_into(self._out, self._shape, self._src_pe)
+            self._done = True
+            return None
+
+    class _NvshmemLocalRecvHandle:
+        """Deferred pop from same-rank FIFO (OctoPipe co-located stages)."""
+
+        __slots__ = ("_comm", "_outs", "_tensor_shapes", "_done")
+
+        def __init__(self, comm, outs: list, tensor_shapes: list):
+            self._comm = comm
+            self._outs = outs
+            self._tensor_shapes = tensor_shapes
+            self._done = False
+
+        def wait(self):
+            if self._done:
+                return None
+            key = (self._comm._rank, self._comm._rank)
+            q = self._comm._local_peer_queues.get(key)
+            if q is None or len(q) == 0:
+                raise RuntimeError("NVSHMEM local peer recv queue is empty (deferred wait)")
+            payload = q.pop(0)
+            if len(payload) != len(self._tensor_shapes):
+                raise RuntimeError(
+                    f"NVSHMEM local peer recv length mismatch: {len(payload)} vs {len(self._tensor_shapes)}"
+                )
+            for t, s, o in zip(payload, self._tensor_shapes, self._outs):
+                if tuple(t.shape) != tuple(s):
+                    raise RuntimeError(
+                        f"NVSHMEM local peer recv shape mismatch: tensor={tuple(t.shape)} expected={tuple(s)}"
+                    )
+                with torch.no_grad():
+                    o.copy_(t)
+            self._done = True
+            return None
+
+    def _get_global_rank(self, group_rank: int) -> int:
+        return torch.distributed.get_global_rank(self.pp_group, group_rank)
+
+    def _resolve_peer_group_rank(self, rank_maybe_global: int) -> int:
+        # Prefer interpreting input as global rank if it belongs to this pp_group.
+        # This avoids ambiguity when global rank id is in [0, pp_size).
+        if rank_maybe_global in self._global_to_pp:
+            return self._global_to_pp[rank_maybe_global]
+        # Fallback: caller passed pp-group rank directly.
+        if 0 <= rank_maybe_global < self._world:
+            return rank_maybe_global
+        raise RuntimeError(
+            f"peer rank {rank_maybe_global} is neither a global rank in this pp_group "
+            f"(global ranks={self._pp_global_ranks}) nor a valid pp-group rank [0,{self._world})."
+        )
+
+    def _send_peer_tensor(self, t: torch.Tensor, dst_group_rank: int):
+        if dst_group_rank == self._rank:
+            raise RuntimeError("NVSHMEM peer send does not support self-send")
+        shape_key = self._shape_key(t.shape)
+        self._ensure_mailboxes_for_shape(t.shape)
+
+        ch_data_tmp = f"peer_tmp_data_{self._rank}_{dst_group_rank}"
+        ch_data_dst = f"peer_data_{self._rank}_{dst_group_rank}"
+        ch_ready_tmp = f"peer_tmp_ready_{self._rank}_{dst_group_rank}"
+        ch_ready_dst = f"peer_ready_{self._rank}_{dst_group_rank}"
+
+        tmp_data = self._get_mailbox(t.shape, ch_data_tmp)
+        tmp_data.copy_(t)
+        dst_data = self._get_mailbox(t.shape, ch_data_dst)
+        self._nv.put(dst=dst_data, src=tmp_data, remote_pe=dst_group_rank, stream=self._stream)
+        self._nv.quiet(stream=self._stream)
+
+        seq_key = (self._rank, dst_group_rank, shape_key)
+        seq = self._send_peer_seq.get(seq_key, 0) + 1
+        self._send_peer_seq[seq_key] = seq
+        tmp_ready = self._get_mailbox(t.shape, ch_ready_tmp)
+        tmp_ready.fill_(seq)
+        dst_ready = self._get_mailbox(t.shape, ch_ready_dst)
+        self._nv.put(dst=dst_ready, src=tmp_ready, remote_pe=dst_group_rank, stream=self._stream)
+        self._nv.quiet(stream=self._stream)
+
+    def _recv_peer_tensor_into(self, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int):
+        """Block until peer data is ready, then copy symmetric mailbox into ``out``."""
+        if src_group_rank == self._rank:
+            raise RuntimeError("NVSHMEM peer recv does not support self-recv")
+        shape_key = self._shape_key(tensor_shape)
+        self._ensure_mailboxes_for_shape(tensor_shape)
+
+        ch_data = f"peer_data_{src_group_rank}_{self._rank}"
+        ch_ready = f"peer_ready_{src_group_rank}_{self._rank}"
+
+        expected_key = (src_group_rank, self._rank, shape_key)
+        expected = self._recv_peer_seq.get(expected_key, 0) + 1
+        ready_local = self._get_mailbox(tensor_shape, ch_ready)
+        while int(ready_local.item()) < expected:
+            pass
+        self._recv_peer_seq[expected_key] = expected
+
+        local = self._get_mailbox(tensor_shape, ch_data)
+        # Avoid in-place on a leaf that requires_grad (autograd forbids copy_ on such leaves).
+        with torch.no_grad():
+            out.copy_(local)
+
+    def _recv_peer_tensor(self, tensor_shape: Shape, src_group_rank: int):
+        out = torch.empty(
+            tuple(tensor_shape) if not isinstance(tensor_shape, torch.Size) else tensor_shape,
+            dtype=self.config.pipeline_dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=True,
+        )
+        self._recv_peer_tensor_into(out, tensor_shape, src_group_rank)
+        return out
+
+    def send_tensor_async(self, send_tensors, dst_rank, stop=False):
+        del stop
+        if not isinstance(send_tensors, list):
+            send_tensors = [send_tensors]
+        dst_group_rank = self._resolve_peer_group_rank(dst_rank)
+        reqs = []
+        if dst_group_rank == self._rank:
+            key = (self._rank, self._rank)
+            if key not in self._local_peer_queues:
+                self._local_peer_queues[key] = []
+            payload = []
+            for t in send_tensors:
+                if t is None:
+                    raise RuntimeError(
+                        "NvshmemP2PCommunicator.send_tensor_async: None tensor (same-rank queue)"
+                    )
+                payload.append(t.clone())
+                reqs.append(self._NvshmemDoneHandle())
+            self._local_peer_queues[key].append(payload)
+            return reqs
+        for t in send_tensors:
+            if t is None:
+                raise RuntimeError("NvshmemP2PCommunicator.send_tensor_async: None tensor in send_tensors")
+            self._send_peer_tensor(t, dst_group_rank)
+            reqs.append(self._NvshmemDoneHandle())
+        return reqs
+
+    def recv_tensor_async(self, tensor_shapes, recv_src_rank):
+        """Match ``P2PCommunicator``: return preallocated buffers; completion in ``handle.wait()``."""
+        unwrap_tensor_shapes = False
+        if is_single_shape(tensor_shapes):
+            unwrap_tensor_shapes = True
+            tensor_shapes = [tensor_shapes]
+
+        src_group_rank = self._resolve_peer_group_rank(recv_src_rank)
+        recvs = []
+        reqs = []
+
+        def _shape_tuple(s):
+            return tuple(s) if not isinstance(s, torch.Size) else tuple(s)
+
+        if src_group_rank == self._rank:
+            outs = [
+                torch.empty(
+                    _shape_tuple(s),
+                    dtype=self.config.pipeline_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=True,
+                )
+                for s in tensor_shapes
+            ]
+            h = self._NvshmemLocalRecvHandle(self, outs, tensor_shapes)
+            # OctoPipe loops all handles; one idempotent wait pops the whole payload.
+            reqs = [h] * len(tensor_shapes)
+            recvs = outs
+            if unwrap_tensor_shapes:
+                return recvs[0], reqs
+            return recvs, reqs
+
+        for s in tensor_shapes:
+            out = torch.empty(
+                _shape_tuple(s),
+                dtype=self.config.pipeline_dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=True,
+            )
+            recvs.append(out)
+            reqs.append(self._NvshmemPeerRecvHandle(self, out, s, src_group_rank))
+
+        if unwrap_tensor_shapes:
+            return recvs[0], reqs
+        return recvs, reqs
+
+    def recv_forward(self, tensor_shapes, is_first_stage: bool):
+        unwrap = False
+        if is_single_shape(tensor_shapes):
+            unwrap = True
+            tensor_shapes = [tensor_shapes]
+        out = []
+        for shape in tensor_shapes:
+            if is_first_stage:
+                out.append(None)
+            else:
+                t, _, _ = self._communicate(None, None, True, False, shape)
+                out.append(t)
+        return out[0] if unwrap else out
+
+    def recv_backward(self, tensor_shapes, is_last_stage: bool):
+        unwrap = False
+        if is_single_shape(tensor_shapes):
+            unwrap = True
+            tensor_shapes = [tensor_shapes]
+        out = []
+        for shape in tensor_shapes:
+            if is_last_stage:
+                out.append(None)
+            else:
+                _, t, _ = self._communicate(None, None, False, True, shape)
+                out.append(t)
+        return out[0] if unwrap else out
+
+    def send_forward(self, output_tensors, is_last_stage: bool):
+        if is_last_stage:
+            return
+        if not isinstance(output_tensors, list):
+            output_tensors = [output_tensors]
+        for t in output_tensors:
+            self._communicate(t, None, False, False, t.shape)
+
+    def send_backward(self, input_tensor_grads, is_first_stage: bool):
+        if is_first_stage:
+            return
+        if not isinstance(input_tensor_grads, list):
+            input_tensor_grads = [input_tensor_grads]
+        for t in input_tensor_grads:
+            self._communicate(None, t, False, False, t.shape)
+
+    def send_forward_recv_backward(self, output_tensors, tensor_shapes, is_last_stage: bool):
+        unwrap_output_tensors = False
+        if not isinstance(output_tensors, list):
+            unwrap_output_tensors = True
+            output_tensors = [output_tensors]
+        if not isinstance(tensor_shapes, list):
+            tensor_shapes = [tensor_shapes]
+        assert len(output_tensors) == len(
+            tensor_shapes
+        ), f"send_forward_recv_backward length mismatch: {len(output_tensors)} vs {len(tensor_shapes)}"
+        out = []
+        for t, s in zip(output_tensors, tensor_shapes):
+            if is_last_stage:
+                # Last stage has no forward peer and should not send anything.
+                out.append(None)
+            else:
+                assert t is not None, "send_forward_recv_backward got None output tensor"
+                assert tuple(t.shape) == tuple(s), (
+                    "send_forward_recv_backward shape mismatch: "
+                    f"tensor={tuple(t.shape)} expected={tuple(s)}"
+                )
+                _, grad, _ = self._communicate(t, None, False, True, s)
+                out.append(grad)
+        return out[0] if unwrap_output_tensors else out
+
+    def send_backward_recv_forward(self, input_tensor_grads, tensor_shapes, is_first_stage: bool):
+        unwrap_input_tensor_grads = False
+        if not isinstance(input_tensor_grads, list):
+            unwrap_input_tensor_grads = True
+            input_tensor_grads = [input_tensor_grads]
+        if not isinstance(tensor_shapes, list):
+            tensor_shapes = [tensor_shapes]
+        assert len(input_tensor_grads) == len(
+            tensor_shapes
+        ), f"send_backward_recv_forward length mismatch: {len(input_tensor_grads)} vs {len(tensor_shapes)}"
+        out = []
+        for t, s in zip(input_tensor_grads, tensor_shapes):
+            if is_first_stage:
+                # First stage has no backward peer and should not send anything.
+                out.append(None)
+            else:
+                assert t is not None, "send_backward_recv_forward got None grad tensor"
+                assert tuple(t.shape) == tuple(s), (
+                    "send_backward_recv_forward shape mismatch: "
+                    f"tensor={tuple(t.shape)} expected={tuple(s)}"
+                )
+                inp, _, _ = self._communicate(None, t, True, False, s)
+                out.append(inp)
+        return out[0] if unwrap_input_tensor_grads else out

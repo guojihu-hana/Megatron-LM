@@ -24,6 +24,7 @@ from megatron.training import get_args, get_timers, get_tokenizer, inprocess_res
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
+    broadcast_labels_loss_mask_for_tp_if_needed,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
@@ -123,13 +124,21 @@ def loss_func(
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
+def forward_step(
+    data_iterator,
+    model: GPTModel,
+    return_schedule_plan: bool = False,
+    is_last_stage: bool = True,
+):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
+        is_last_stage (bool): Whether this forward computes the loss (pipeline last stage). OctoPipe
+            passes False for non-final stages; when True with TP>1, labels/loss_mask are broadcast
+            within the TP group if needed (see ``broadcast_labels_loss_mask_for_tp_if_needed``).
     """
     args = get_args()
     timers = get_timers()
@@ -140,6 +149,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
+        labels, loss_mask = broadcast_labels_loss_mask_for_tp_if_needed(
+            labels, loss_mask, is_last_stage
+        )
     timers('batch-generator').stop()
 
     with stimer:

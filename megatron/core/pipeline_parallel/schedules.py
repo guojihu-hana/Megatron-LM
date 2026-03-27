@@ -1,6 +1,8 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import inspect
+import os
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union, Dict
 
@@ -10,7 +12,10 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.weight_gradient_store import WeightGradStore
 from megatron.core.enums import ModelType
-from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.p2p_communication import (
+    NvshmemP2PCommunicator,
+    P2PCommunicator,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -33,10 +38,6 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-
-# Types
-Shape = Union[List[int], torch.Size]
-
 
 def get_forward_backward_func():
     """Retrieves the appropriate forward_backward function given the
@@ -407,11 +408,26 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            _fsig = inspect.signature(forward_step_func)
+            if "is_last_stage" in _fsig.parameters:
+                output_tensor, loss_func = forward_step_func(
+                    data_iterator, model, is_last_stage=is_last_stage
+                )
+            else:
+                output_tensor, loss_func = forward_step_func(data_iterator, model)
         else:
-            output_tensor, loss_func = forward_step_func(
-                data_iterator, model, checkpoint_activations_microbatch
-            )
+            _fsig = inspect.signature(forward_step_func)
+            if "is_last_stage" in _fsig.parameters:
+                output_tensor, loss_func = forward_step_func(
+                    data_iterator,
+                    model,
+                    checkpoint_activations_microbatch,
+                    is_last_stage=is_last_stage,
+                )
+            else:
+                output_tensor, loss_func = forward_step_func(
+                    data_iterator, model, checkpoint_activations_microbatch
+                )
     output_tensor, num_tokens = forward_step_calc_loss(
         model,
         output_tensor,
@@ -1991,14 +2007,15 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     if p2p_communicator is None and pg_collection is None:
-        p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
-        )
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        if os.environ.get("MEGATRON_NVSHMEM_P2P", "0") == "1":
+            p2p_communicator = NvshmemP2PCommunicator(pp_group=pp_group, config=config)
+        else:
+            p2p_communicator = P2PCommunicator(pp_group=pp_group, config=config)
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
 
         pg_collection = ProcessGroupCollection()
         pg_collection.tp = tp_group
@@ -2348,14 +2365,15 @@ def forward_backward_pipelining_of_octopipe(
     config = get_model_config(model[0])
     
     if p2p_communicator is None and pg_collection is None:
-        p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
-        )
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        if os.environ.get("MEGATRON_NVSHMEM_P2P", "0") == "1":
+            p2p_communicator = NvshmemP2PCommunicator(pp_group=pp_group, config=config)
+        else:
+            p2p_communicator = P2PCommunicator(pp_group=pp_group, config=config)
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
 
         pg_collection = ProcessGroupCollection()
         pg_collection.tp = tp_group

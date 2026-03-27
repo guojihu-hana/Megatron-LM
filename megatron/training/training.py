@@ -1623,6 +1623,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Average loss across microbatches.
         loss_reduced = {}
 
+        # All tensor-parallel ranks share the same PP rank; Megatron marks every TP rank at the
+        # last PP stage as "last". Schedules (e.g. OctoPipe) may only append loss dicts on ranks
+        # that actually run the last logical stage forward, so forward_data_store can be empty.
+        if len(losses_reduced) == 0:
+            return (
+                loss_reduced,
+                skipped_iter,
+                should_checkpoint,
+                should_exit,
+                exit_code,
+                grad_norm,
+                num_zeros_in_grad,
+                log_max_attention_logit,
+            )
+
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
