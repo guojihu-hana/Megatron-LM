@@ -2420,6 +2420,8 @@ def forward_backward_pipelining_of_octopipe(
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     workloads = octopipe_config["workloads"][pp_rank]
+    if isinstance(p2p_communicator, NvshmemP2PCommunicator):
+        p2p_communicator.register_workload_routes(workloads)
     device_stage_mapping = octopipe_config["did->sid"]
 
     stages = device_stage_mapping[pp_rank]
@@ -2639,25 +2641,51 @@ def forward_backward_pipelining_of_octopipe(
             src_sid = workload['sender_sid']
             dst_sid = workload['recver_sid']
             dst_rank = stage_device_mapping[dst_sid]
+            nvshmem_route_kwargs = {}
+            if isinstance(p2p_communicator, NvshmemP2PCommunicator):
+                nvshmem_route_kwargs = {
+                    "sender_sid": src_sid,
+                    "recver_sid": dst_sid,
+                    "mid": mid,
+                }
             if wtype == 'f':
                 output_tensor = output_tensors[mid][src_sid]
-                p2p_communicator.send_tensor_async(output_tensor, p2p_communicator._get_global_rank(dst_rank))
+                p2p_communicator.send_tensor_async(
+                    output_tensor,
+                    p2p_communicator._get_global_rank(dst_rank),
+                    **nvshmem_route_kwargs,
+                )
             elif wtype == 'b':
                 input_tensor_grad = input_tensor_grads[mid][src_sid]
-                p2p_communicator.send_tensor_async(input_tensor_grad, p2p_communicator._get_global_rank(dst_rank))            
+                p2p_communicator.send_tensor_async(
+                    input_tensor_grad,
+                    p2p_communicator._get_global_rank(dst_rank),
+                    **nvshmem_route_kwargs,
+                )
             else:
                 raise ValueError(f"{op} Workload Type Error: {wtype}")
         elif op == 'recv':
             src_sid = workload['sender_sid']
             dst_sid = workload['recver_sid']
             src_rank = stage_device_mapping[src_sid]
+            nvshmem_route_kwargs = {}
+            if isinstance(p2p_communicator, NvshmemP2PCommunicator):
+                nvshmem_route_kwargs = {
+                    "sender_sid": src_sid,
+                    "recver_sid": dst_sid,
+                    "mid": mid,
+                }
             if wtype == 'f':
                 input_tensors_recv_buffer[mid][dst_sid], input_tensors_handles[mid][dst_sid] = p2p_communicator.recv_tensor_async(
-                    recv_tensor_shapes, recv_src_rank=p2p_communicator._get_global_rank(src_rank)
+                    recv_tensor_shapes,
+                    recv_src_rank=p2p_communicator._get_global_rank(src_rank),
+                    **nvshmem_route_kwargs,
                 )
             elif wtype == 'b':
                 output_tensor_grads_recv_buffer[mid][dst_sid], output_tensor_grads_handles[mid][dst_sid] = p2p_communicator.recv_tensor_async(
-                    send_tensor_shapes, recv_src_rank=p2p_communicator._get_global_rank(src_rank)
+                    send_tensor_shapes,
+                    recv_src_rank=p2p_communicator._get_global_rank(src_rank),
+                    **nvshmem_route_kwargs,
                 )
             else:
                 raise ValueError(f"{op} Workload Type Error: {wtype}")

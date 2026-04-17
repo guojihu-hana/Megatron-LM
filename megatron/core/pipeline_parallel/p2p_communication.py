@@ -944,6 +944,19 @@ class NvshmemP2PCommunicator:
         self._send_peer_seq = {}
         self._recv_peer_seq = {}
         self._local_peer_queues = {}
+        self._pending_peer_payloads = {}
+        # Bound pending stash growth to avoid unbounded GPU clones under
+        # prolonged out-of-order traffic.
+        self._pending_peer_payloads_max = int(
+            os.environ.get("MEGATRON_NVSHMEM_PENDING_MAX", "256")
+        )
+        self._pending_overflow_warned = False
+        # Ring buffer slots per peer channel to avoid payload overwrite.
+        self._peer_slots = int(os.environ.get("MEGATRON_NVSHMEM_PEER_SLOTS", "8"))
+        assert self._peer_slots >= 2, "MEGATRON_NVSHMEM_PEER_SLOTS must be >= 2"
+        self._trace_max = int(os.environ.get("MEGATRON_NVSHMEM_TRACE_MAX", "0"))
+        self._trace_count = 0
+        self._warned_remote_ready_fallback = False
         self._init_nvshmem()
 
     def _init_nvshmem(self):
@@ -972,6 +985,18 @@ class NvshmemP2PCommunicator:
     def _shape_key(self, tensor_shape: Shape):
         shape = tuple(tensor_shape) if isinstance(tensor_shape, (list, tuple, torch.Size)) else (tensor_shape,)
         return (shape, str(self.config.pipeline_dtype))
+
+    def _trace_event(self, message: str):
+        # MEGATRON_NVSHMEM_TRACE_MAX semantics:
+        #   <0 : disabled
+        #    0 : unlimited
+        #   >0 : print at most N lines per rank
+        if self._trace_max < 0:
+            return
+        if self._trace_max > 0 and self._trace_count >= self._trace_max:
+            return
+        print(f"[nvshmem-trace][rank={self._rank}] {message}", flush=True)
+        self._trace_count += 1
 
     def _ensure_mailboxes_for_shape(self, tensor_shape: Shape):
         """Allocate all channel mailboxes for a shape in a synchronized order.
@@ -1005,37 +1030,49 @@ class NvshmemP2PCommunicator:
                 else:
                     self._mailboxes[mkey] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
 
-        # Allocate point-to-point channels for arbitrary PP-rank communication
-        # used by OctoPipe send_tensor_async/recv_tensor_async.
+        # Allocate point-to-point channels for arbitrary PP-rank communication.
         for src in range(self._world):
-            for dst in range(self._world):
-                if src == dst:
-                    continue
+            for slot in range(self._peer_slots):
                 for channel in (
-                    f"peer_data_{src}_{dst}",
-                    f"peer_tmp_data_{src}_{dst}",
-                    f"peer_ready_{src}_{dst}",
-                    f"peer_tmp_ready_{src}_{dst}",
+                    f"peer_data_from_{src}_slot_{slot}",
+                    f"peer_ready_from_{src}_slot_{slot}",
                 ):
                     mkey = (channel, shape, str(self.config.pipeline_dtype))
                     if mkey not in self._mailboxes:
                         if "ready" in channel:
-                            t = self._nv.tensor((1,), dtype=torch.int32)
+                            t = self._nv.tensor((1,), dtype=torch.int64)
                             t.zero_()
                             self._mailboxes[mkey] = t
                         else:
-                            self._mailboxes[mkey] = self._nv.tensor(
-                                shape, dtype=self.config.pipeline_dtype
-                            )
+                            self._mailboxes[mkey] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
+        for channel in ("peer_tmp_data", "peer_tmp_ready"):
+            mkey = (channel, shape, str(self.config.pipeline_dtype))
+            if mkey not in self._mailboxes:
+                if "ready" in channel:
+                    t = self._nv.tensor((1,), dtype=torch.int64)
+                    t.zero_()
+                    self._mailboxes[mkey] = t
+                else:
+                    self._mailboxes[mkey] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
         torch.distributed.barrier(group=self.pp_group)
         self._shape_initialized.add(key)
+
+    def register_workload_routes(self, workloads):
+        # No-op: keep API compatibility with schedules.py.
+        del workloads
 
     def _get_mailbox(self, tensor_shape: Shape, channel: str):
         self._ensure_mailboxes_for_shape(tensor_shape)
         key = (channel,) + self._shape_key(tensor_shape)
         if key not in self._mailboxes:
             shape = key[1]
-            self._mailboxes[key] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
+            if "ready" in channel:
+                ready_dtype = torch.int64 if "peer_" in channel else torch.int32
+                t = self._nv.tensor((1,), dtype=ready_dtype)
+                t.zero_()
+                self._mailboxes[key] = t
+            else:
+                self._mailboxes[key] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
         return self._mailboxes[key]
 
     def _communicate(self, tensor_send_next, tensor_send_prev, recv_prev: bool, recv_next: bool, tensor_shape: Shape):
@@ -1101,37 +1138,47 @@ class NvshmemP2PCommunicator:
     class _NvshmemPeerRecvHandle:
         """Deferred NVSHMEM peer recv — matches NCCL ``irecv`` + ``wait()`` semantics for OctoPipe."""
 
-        __slots__ = ("_comm", "_out", "_shape", "_src_pe", "_done")
+        __slots__ = ("_comm", "_out", "_shape", "_src_pe", "_done", "_route_key")
 
-        def __init__(self, comm, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int):
+        def __init__(
+            self, comm, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int, route_key=None
+        ):
             self._comm = comm
             self._out = out
             self._shape = tensor_shape
             self._src_pe = src_group_rank
             self._done = False
+            self._route_key = route_key
 
         def wait(self):
             if self._done:
                 return None
-            self._comm._recv_peer_tensor_into(self._out, self._shape, self._src_pe)
+            self._comm._recv_peer_tensor_into(
+                self._out, self._shape, self._src_pe, route_key=self._route_key
+            )
             self._done = True
             return None
 
     class _NvshmemLocalRecvHandle:
         """Deferred pop from same-rank FIFO (OctoPipe co-located stages)."""
 
-        __slots__ = ("_comm", "_outs", "_tensor_shapes", "_done")
+        __slots__ = ("_comm", "_outs", "_tensor_shapes", "_done", "_queue_key")
 
-        def __init__(self, comm, outs: list, tensor_shapes: list):
+        def __init__(self, comm, outs: list, tensor_shapes: list, queue_key=None):
             self._comm = comm
             self._outs = outs
             self._tensor_shapes = tensor_shapes
             self._done = False
+            self._queue_key = queue_key
 
         def wait(self):
             if self._done:
                 return None
-            key = (self._comm._rank, self._comm._rank)
+            key = (
+                self._queue_key
+                if self._queue_key is not None
+                else (self._comm._rank, self._comm._rank, None)
+            )
             q = self._comm._local_peer_queues.get(key)
             if q is None or len(q) == 0:
                 raise RuntimeError("NVSHMEM local peer recv queue is empty (deferred wait)")
@@ -1153,6 +1200,83 @@ class NvshmemP2PCommunicator:
     def _get_global_rank(self, group_rank: int) -> int:
         return torch.distributed.get_global_rank(self.pp_group, group_rank)
 
+    def _msg_route_key(self, sender_sid=None, recver_sid=None, mid=None):
+        # Keep transport routing independent per (sender, receiver, microbatch).
+        # Physical symmetric mailboxes are still shared by src+slot only; this
+        # key only affects logical matching/tagging/sequence bookkeeping.
+        return (sender_sid, recver_sid, mid)
+
+    def _ready_tag(self, route_key, seq: int) -> int:
+        # Deterministic 63-bit tag: [sender(16)][recver(16)][mid(16)][seq(15)].
+        if isinstance(route_key, tuple) and len(route_key) == 3:
+            s_sid, r_sid, mid = route_key
+        elif isinstance(route_key, tuple) and len(route_key) == 2:
+            s_sid, r_sid = route_key
+            mid = 0
+        else:
+            s_sid, r_sid, mid = (0, 0, 0)
+        s = (0 if s_sid is None else int(s_sid)) & 0xFFFF
+        r = (0 if r_sid is None else int(r_sid)) & 0xFFFF
+        m = (0 if mid is None else int(mid)) & 0xFFFF
+        q = int(seq) & 0x7FFF
+        return (s << 47) | (r << 31) | (m << 15) | q
+
+    def _decode_ready_tag(self, tag: int):
+        tag = int(tag)
+        seq = tag & 0x7FFF
+        mid = (tag >> 15) & 0xFFFF
+        recver_sid = (tag >> 31) & 0xFFFF
+        sender_sid = (tag >> 47) & 0xFFFF
+        return sender_sid, recver_sid, mid, seq
+
+    def _route_from_tag(self, sender_sid: int, recver_sid: int, mid: int, route_key):
+        if isinstance(route_key, tuple) and len(route_key) == 3:
+            return (sender_sid, recver_sid, mid)
+        if isinstance(route_key, tuple) and len(route_key) == 2:
+            return (sender_sid, recver_sid)
+        return (sender_sid, recver_sid)
+
+    def _peer_slot(self, route_key, seq: int) -> int:
+        # Deterministic mixed hash so sender/recver/mid/seq all affect slot selection.
+        if isinstance(route_key, tuple) and len(route_key) == 2:
+            s_sid, r_sid = route_key
+            mid = 0
+        elif isinstance(route_key, tuple) and len(route_key) == 3:
+            s_sid, r_sid, mid = route_key
+        else:
+            s_sid, r_sid, mid = (0, 0, 0)
+        s = (0 if s_sid is None else int(s_sid)) & 0xFFFFFFFF
+        r = (0 if r_sid is None else int(r_sid)) & 0xFFFFFFFF
+        m = (0 if mid is None else int(mid)) & 0xFFFFFFFF
+        q = int(seq) & 0xFFFFFFFF
+        mixed = (
+            (s * 1315423911)
+            ^ (r * 2654435761)
+            ^ (m * 2246822519)
+            ^ (q * 3266489917)
+        ) & 0xFFFFFFFF
+        return mixed % self._peer_slots
+
+    def _peek_remote_ready(self, tensor_shape: Shape, src_group_rank: int, slot: int, remote_pe: int) -> int:
+        """Read remote PE's ready flag for src+slot. Returns int64 tag (0 means empty)."""
+        ch_ready = f"peer_ready_from_{src_group_rank}_slot_{slot}"
+        remote_ready = self._get_mailbox(tensor_shape, ch_ready)
+        tmp_ready = self._get_mailbox(tensor_shape, "peer_tmp_ready")
+        try:
+            # Preferred: probe receiver-side occupancy via remote GET.
+            self._nv.get(dst=tmp_ready, src=remote_ready, remote_pe=remote_pe, stream=self._stream)
+            self._nv.quiet(stream=self._stream)
+            return int(tmp_ready.item())
+        except Exception:
+            # Fallback when Python binding lacks get(): preserves previous behavior.
+            if not self._warned_remote_ready_fallback:
+                self._warned_remote_ready_fallback = True
+                self._trace_event(
+                    "warn remote-ready-probe-fallback=local-item "
+                    "(nvshmem.get unavailable in current python binding)"
+                )
+            return int(remote_ready.item())
+
     def _resolve_peer_group_rank(self, rank_maybe_global: int) -> int:
         # Prefer interpreting input as global rank if it belongs to this pp_group.
         # This avoids ambiguity when global rank id is in [0, pp_size).
@@ -1166,72 +1290,184 @@ class NvshmemP2PCommunicator:
             f"(global ranks={self._pp_global_ranks}) nor a valid pp-group rank [0,{self._world})."
         )
 
-    def _send_peer_tensor(self, t: torch.Tensor, dst_group_rank: int):
+    def _send_peer_tensor(self, t: torch.Tensor, dst_group_rank: int, route_key=None):
         if dst_group_rank == self._rank:
             raise RuntimeError("NVSHMEM peer send does not support self-send")
         shape_key = self._shape_key(t.shape)
         self._ensure_mailboxes_for_shape(t.shape)
 
-        ch_data_tmp = f"peer_tmp_data_{self._rank}_{dst_group_rank}"
-        ch_data_dst = f"peer_data_{self._rank}_{dst_group_rank}"
-        ch_ready_tmp = f"peer_tmp_ready_{self._rank}_{dst_group_rank}"
-        ch_ready_dst = f"peer_ready_{self._rank}_{dst_group_rank}"
+        ch_data_tmp = "peer_tmp_data"
+        ch_ready_tmp = "peer_tmp_ready"
 
         tmp_data = self._get_mailbox(t.shape, ch_data_tmp)
         tmp_data.copy_(t)
+        seq_key = (self._rank, dst_group_rank, shape_key, route_key)
+        seq = self._send_peer_seq.get(seq_key, 0) + 1
+        preferred_slot = self._peer_slot(route_key, seq)
+        slot = None
+        dst_ready = None
+        spin = 0
+        max_spin = int(os.environ.get("MEGATRON_NVSHMEM_SEND_WAIT_MAX_SPIN", "0"))
+        while slot is None:
+            # Probe for any free slot to avoid head-of-line blocking.
+            for offset in range(self._peer_slots):
+                cand_slot = (preferred_slot + offset) % self._peer_slots
+                seen_tag = self._peek_remote_ready(
+                    t.shape, src_group_rank=self._rank, slot=cand_slot, remote_pe=dst_group_rank
+                )
+                if seen_tag == 0:
+                    slot = cand_slot
+                    ch_ready_cand = f"peer_ready_from_{self._rank}_slot_{cand_slot}"
+                    dst_ready = self._get_mailbox(t.shape, ch_ready_cand)
+                    break
+            if max_spin > 0:
+                spin += 1
+            if max_spin > 0 and spin >= max_spin:
+                raise RuntimeError(
+                    "NVSHMEM peer send wait timeout: no free slot on receiver. "
+                    f"src_pe={self._rank} dst_pe={dst_group_rank} preferred_slot={preferred_slot} "
+                    f"route_key={route_key} seq={seq}"
+                )
+        ch_data_dst = f"peer_data_from_{self._rank}_slot_{slot}"
+        ch_ready_dst = f"peer_ready_from_{self._rank}_slot_{slot}"
+        self._trace_event(
+            f"send src={self._rank} dst={dst_group_rank} route={route_key} seq={seq} slot={slot} pref={preferred_slot}"
+        )
+        self._send_peer_seq[seq_key] = seq
+
         dst_data = self._get_mailbox(t.shape, ch_data_dst)
         self._nv.put(dst=dst_data, src=tmp_data, remote_pe=dst_group_rank, stream=self._stream)
         self._nv.quiet(stream=self._stream)
-
-        seq_key = (self._rank, dst_group_rank, shape_key)
-        seq = self._send_peer_seq.get(seq_key, 0) + 1
-        self._send_peer_seq[seq_key] = seq
         tmp_ready = self._get_mailbox(t.shape, ch_ready_tmp)
-        tmp_ready.fill_(seq)
-        dst_ready = self._get_mailbox(t.shape, ch_ready_dst)
+        tmp_ready.fill_(self._ready_tag(route_key, seq))
         self._nv.put(dst=dst_ready, src=tmp_ready, remote_pe=dst_group_rank, stream=self._stream)
         self._nv.quiet(stream=self._stream)
 
-    def _recv_peer_tensor_into(self, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int):
+    def _recv_peer_tensor_into(
+        self, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int, route_key=None
+    ):
         """Block until peer data is ready, then copy symmetric mailbox into ``out``."""
         if src_group_rank == self._rank:
             raise RuntimeError("NVSHMEM peer recv does not support self-recv")
         shape_key = self._shape_key(tensor_shape)
         self._ensure_mailboxes_for_shape(tensor_shape)
 
-        ch_data = f"peer_data_{src_group_rank}_{self._rank}"
-        ch_ready = f"peer_ready_{src_group_rank}_{self._rank}"
-
-        expected_key = (src_group_rank, self._rank, shape_key)
+        expected_key = (src_group_rank, self._rank, shape_key, route_key)
         expected = self._recv_peer_seq.get(expected_key, 0) + 1
-        ready_local = self._get_mailbox(tensor_shape, ch_ready)
-        while int(ready_local.item()) < expected:
-            pass
+        expected_tag = self._ready_tag(route_key, expected)
+        pending_key = (src_group_rank, self._rank, shape_key, route_key, expected)
+        pending = self._pending_peer_payloads.pop(pending_key, None)
+        if pending is not None:
+            with torch.no_grad():
+                out.copy_(pending)
+            self._trace_event(
+                f"recv-pending src={src_group_rank} dst={self._rank} route={route_key} seq={expected}"
+            )
+            self._recv_peer_seq[expected_key] = expected
+            return
+        spin = 0
+        matched_slot = None
+        matched_ready = None
+        # Diagnostic timeout is opt-in. Default (0) waits indefinitely.
+        max_spin = int(os.environ.get("MEGATRON_NVSHMEM_WAIT_MAX_SPIN", "0"))
+        while matched_slot is None:
+            for slot in range(self._peer_slots):
+                ch_ready = f"peer_ready_from_{src_group_rank}_slot_{slot}"
+                ready_local = self._get_mailbox(tensor_shape, ch_ready)
+                seen_tag = int(ready_local.item())
+                if seen_tag == 0:
+                    continue
+                if seen_tag == expected_tag:
+                    matched_slot = slot
+                    matched_ready = ready_local
+                    break
+                # Receive-and-stash unexpected message to free the slot.
+                s_sid, r_sid, m_sid, q_seq = self._decode_ready_tag(seen_tag)
+                stash_route = self._route_from_tag(s_sid, r_sid, m_sid, route_key)
+                stash_key = (src_group_rank, self._rank, shape_key, stash_route, q_seq)
+                if stash_key not in self._pending_peer_payloads:
+                    if self._pending_peer_payloads_max <= 0 or len(self._pending_peer_payloads) < self._pending_peer_payloads_max:
+                        ch_data_seen = f"peer_data_from_{src_group_rank}_slot_{slot}"
+                        local_seen = self._get_mailbox(tensor_shape, ch_data_seen)
+                        self._pending_peer_payloads[stash_key] = local_seen.clone()
+                        self._trace_event(
+                            f"stash src={src_group_rank} dst={self._rank} route={stash_route} seq={q_seq} slot={slot}"
+                        )
+                        with torch.no_grad():
+                            ready_local.zero_()
+                    else:
+                        if not self._pending_overflow_warned:
+                            self._pending_overflow_warned = True
+                            self._trace_event(
+                                f"warn pending-overflow size={len(self._pending_peer_payloads)} "
+                                f"limit={self._pending_peer_payloads_max}; stop stashing unexpected payloads"
+                            )
+            if max_spin > 0:
+                spin += 1
+            if max_spin > 0 and spin >= max_spin:
+                seen_tag = 0
+                seen_slot = -1
+                for slot in range(self._peer_slots):
+                    ch_ready = f"peer_ready_from_{src_group_rank}_slot_{slot}"
+                    cand = int(self._get_mailbox(tensor_shape, ch_ready).item())
+                    if cand != 0:
+                        seen_tag = cand
+                        seen_slot = slot
+                        break
+                s_sid, r_sid, m_sid, q_seq = self._decode_ready_tag(seen_tag)
+                if isinstance(route_key, tuple) and len(route_key) == 2:
+                    exp_s, exp_r, exp_m = route_key[0], route_key[1], 0
+                elif isinstance(route_key, tuple) and len(route_key) == 3:
+                    exp_s, exp_r, exp_m = route_key
+                else:
+                    exp_s, exp_r, exp_m = (None, None, None)
+                raise RuntimeError(
+                    "NVSHMEM peer recv wait timeout: sender not reached yet or mailbox collision. "
+                    f"src_pe={src_group_rank} dst_pe={self._rank} slot={seen_slot} "
+                    f"expected_tag={expected_tag} expected_route=({exp_s},{exp_r},{exp_m}) expected_seq={expected} "
+                    f"seen_tag={seen_tag} seen_route=({s_sid},{r_sid},{m_sid}) seen_seq={q_seq}"
+                )
+        self._trace_event(
+            f"recv src={src_group_rank} dst={self._rank} route={route_key} seq={expected} slot={matched_slot}"
+        )
         self._recv_peer_seq[expected_key] = expected
 
+        ch_data = f"peer_data_from_{src_group_rank}_slot_{matched_slot}"
         local = self._get_mailbox(tensor_shape, ch_data)
         # Avoid in-place on a leaf that requires_grad (autograd forbids copy_ on such leaves).
         with torch.no_grad():
             out.copy_(local)
+            # Mark this slot as reusable after payload is consumed.
+            matched_ready.zero_()
 
-    def _recv_peer_tensor(self, tensor_shape: Shape, src_group_rank: int):
+    def _recv_peer_tensor(self, tensor_shape: Shape, src_group_rank: int, route_key=None):
         out = torch.empty(
             tuple(tensor_shape) if not isinstance(tensor_shape, torch.Size) else tensor_shape,
             dtype=self.config.pipeline_dtype,
             device=torch.cuda.current_device(),
             requires_grad=True,
         )
-        self._recv_peer_tensor_into(out, tensor_shape, src_group_rank)
+        self._recv_peer_tensor_into(out, tensor_shape, src_group_rank, route_key=route_key)
         return out
 
-    def send_tensor_async(self, send_tensors, dst_rank, stop=False):
+    def send_tensor_async(
+        self,
+        send_tensors,
+        dst_rank,
+        stop=False,
+        *,
+        sender_sid=None,
+        recver_sid=None,
+        mid=None,
+    ):
         del stop
         if not isinstance(send_tensors, list):
             send_tensors = [send_tensors]
         dst_group_rank = self._resolve_peer_group_rank(dst_rank)
+        route_key = self._msg_route_key(sender_sid=sender_sid, recver_sid=recver_sid, mid=mid)
         reqs = []
         if dst_group_rank == self._rank:
-            key = (self._rank, self._rank)
+            key = (self._rank, self._rank, route_key)
             if key not in self._local_peer_queues:
                 self._local_peer_queues[key] = []
             payload = []
@@ -1247,11 +1483,19 @@ class NvshmemP2PCommunicator:
         for t in send_tensors:
             if t is None:
                 raise RuntimeError("NvshmemP2PCommunicator.send_tensor_async: None tensor in send_tensors")
-            self._send_peer_tensor(t, dst_group_rank)
+            self._send_peer_tensor(t, dst_group_rank, route_key=route_key)
             reqs.append(self._NvshmemDoneHandle())
         return reqs
 
-    def recv_tensor_async(self, tensor_shapes, recv_src_rank):
+    def recv_tensor_async(
+        self,
+        tensor_shapes,
+        recv_src_rank,
+        *,
+        sender_sid=None,
+        recver_sid=None,
+        mid=None,
+    ):
         """Match ``P2PCommunicator``: return preallocated buffers; completion in ``handle.wait()``."""
         unwrap_tensor_shapes = False
         if is_single_shape(tensor_shapes):
@@ -1259,6 +1503,7 @@ class NvshmemP2PCommunicator:
             tensor_shapes = [tensor_shapes]
 
         src_group_rank = self._resolve_peer_group_rank(recv_src_rank)
+        route_key = self._msg_route_key(sender_sid=sender_sid, recver_sid=recver_sid, mid=mid)
         recvs = []
         reqs = []
 
@@ -1275,7 +1520,9 @@ class NvshmemP2PCommunicator:
                 )
                 for s in tensor_shapes
             ]
-            h = self._NvshmemLocalRecvHandle(self, outs, tensor_shapes)
+            h = self._NvshmemLocalRecvHandle(
+                self, outs, tensor_shapes, queue_key=(self._rank, self._rank, route_key)
+            )
             # OctoPipe loops all handles; one idempotent wait pops the whole payload.
             reqs = [h] * len(tensor_shapes)
             recvs = outs
@@ -1291,7 +1538,11 @@ class NvshmemP2PCommunicator:
                 requires_grad=True,
             )
             recvs.append(out)
-            reqs.append(self._NvshmemPeerRecvHandle(self, out, s, src_group_rank))
+            reqs.append(
+                self._NvshmemPeerRecvHandle(
+                    self, out, s, src_group_rank, route_key=route_key
+                )
+            )
 
         if unwrap_tensor_shapes:
             return recvs[0], reqs

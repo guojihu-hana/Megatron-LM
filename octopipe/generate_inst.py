@@ -880,7 +880,9 @@ def get_octopipe_config(partition_path, placement_path, results_path):
         scheduling,
     )
 
+    # NVSHMEM-Based P2P Comm order
     # workload_comp_comm_order = insert_comm_ops(workload_exe_order, stage_device_mapping)
+    # NCCL-Based P2P Comm order
     workload_comp_comm_order = overlap_aware_comm_insert(workload_exe_order, stage_device_mapping)
     
     layout = generate_pipeline_layout(partition=partition, placement=placement)
