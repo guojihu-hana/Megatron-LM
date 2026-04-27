@@ -1,5 +1,43 @@
 <div align="center">
 
+# OctoPipe: Reducing Pipeline Bubbles for Heterogeneous Models via Co-Optimizing Partitioning, Placement, and Scheduling
+
+This fork layers an **OctoPipe** executor on Megatron-LM so you can run **co-optimized** pipeline schedules: irregular **partitioning**, **placement**-aware stage layout, and matching **scheduling** policies.
+
+### Features (beyond stock Megatron-LM)
+
+1. **OctoPipe schedule** — integrated in `megatron/core/pipeline_parallel/schedules.py`.
+2. **Asymmetric** model partition and placement strategies.
+3. **Pipeline parallelism for Mamba** — see commit `8c1d4d9240a5d895f05e9b733864838e64580c68`.
+
+### Experimental setup (paper-aligned)
+
+- **Hardware:** 16 nodes × 8× H800 GPUs, 200 GB/s **NVLink** within each node; **8×200 Gbps RoCEv2** between nodes.
+- **Software:** NVIDIA PyTorch container `nvcr.io/nvidia/pytorch:25.12-py3` for the experiments described below.
+
+### Quick start — Nemotron-H-4B
+
+Run scripts and per-size configs live under `octopipe/nemotronh/` (e.g. `4B/run.sh`). Partition / placement artifacts used by the executor are under `octopipe/debug_config/nemotron/`.
+
+1. `cd octopipe/nemotronh/4B` (from the inner `Megatron-LM/` repo root).
+2. `bash run.sh`
+3. Toggle **`PP_MODE`** for baselines vs OctoPipe; adjust **`VPP`** and **`PP_LAYOUTS`** as needed for other baseline schedules.
+
+| **OctoPipe** | **1F1B** |
+|:-:|:-:|
+| ![OctoPipe pipeline schedule](octopipe/nemotronh/OctoPipe.svg) | ![1F1B pipeline schedule](octopipe/nemotronh/1F1B.svg) |
+
+| **Interleaved 1F1B** | **MiST** |
+|:-:|:-:|
+| ![Interleaved 1F1B pipeline schedule](octopipe/nemotronh/Interleaved-1F1B.svg) | ![MiST pipeline schedule](octopipe/nemotronh/Mist.svg) |
+
+### Profiling layer-wise compute (simulator / tuner)
+
+1. `export CUDA_LAUNCH_BLOCKING=1` (accurate CPU-side timings; slower).
+2. `bash run.sh` (with profiling flags enabled in your `config.sh`, if applicable).
+3. Collect timing dumps under `pp_timing/` at your workspace root (layout may vary with launch path).
+4. Feed those traces into the OctoPipe **simulator** and **tuner** for co-optimization.
+
 Megatron-LM & Megatron Core
 ===========================
 

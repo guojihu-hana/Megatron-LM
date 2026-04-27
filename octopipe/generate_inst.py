@@ -976,112 +976,12 @@ def print_ops(workload_comp_comm_order, skip_comp=True, s_sid:list=[], r_sid:lis
                 print(f"{color}{idx+s} {output:<{width}}{COLOR_RESET}", end="")
         print()
 
-def recv_fwd():
-    pass
-def fwd_step():
-    pass
-def send_fwd():
-    pass
-def recv_bwd():
-    pass
-def bwd_step():
-    pass
-def send_bwd():
-    pass
-def send_fwd_recv_bwd():
-    pass
-def send_bwd_recv_fwd():
-    pass
-def send_fwd_recv_fwd():
-    pass
-def send_bwd_recv_bwd():
-    pass
-
-def recv():
-    pass
-def send():
-    pass
-
-def wait_and_recv():
-    pass
-
-class Node:
-    def __init__(self, comp=False, send=False, recv=False):
-        self.type = 'comp' if comp else 'send' if send else 'recv'
-        self.data_not_ready = True if self.type == 'fwd' or self.type == 'bwd' else False
-
-class Graph:
-    def __init__(self, nodes:List[Node], pp_size:int):
-        self.nodes = nodes
-        self.pp_size = pp_size
-    def sub_graph(self, pp_rank:int) -> List[Node]:
-        return self.nodes[pp_rank*len(self.nodes)//self.pp_size:(pp_rank+1)*len(self.nodes)//self.pp_size]
-
-
-def OctoPipe_Executor(graph:Graph, pp_rank:int):
-    sub_graph = graph.sub_graph(pp_rank)
-    # Unified execution workflow
-    for node in sub_graph:
-        if node.type == 'comp':
-            if node.data_not_ready:
-                wait_and_recv()
-            if node.type == 'fwd':
-                fwd_step() # Comp.
-            elif node.type == 'bwd':
-                bwd_step() # Comp.
-        elif node.type == 'send':
-            send() # Comm.
-        elif node.type == 'recv':
-            recv() # Comm.
-
-def OneFOneB_Executor():
-    # Run warmup phase.
-    for mb in range(warmup):
-        recv_fwd() # Comm.
-        fwd_step() # Comp.
-        send_fwd() # Comm.
-
-    # Run steady phase.
-    for mb in range(steady):
-        fwd_step() # Comp.
-        send_fwd_recv_bwd() # Comm.
-        bwd_step() # Comp.
-        send_bwd_recv_fwd() # Comm.
-
-    # Run cooldown phase.
-    for mb in range(cooldown):
-        recv_bwd() # Comm.
-        bwd_step() # Comp.
-        send_bwd() # Comm.
-
-def Interleaved_1F1B_Executor():
-    # Run warmup forward phase.
-    for i in range():
-        recv_fwd_sync() # Comm.
-        fwd_step() # Comp.
-        send_fwd_recv_fwd() # Comm.
-
-    # Run steady phase.
-    for i in range():
-        recv_fwd_sync() # Comm.
-        fwd_step() # Comp.
-        send_fwd_recv_fwd() # Comm.
-        recv_bwd_sync() # Comm.
-        bwd_step() # Comp.
-        send_bwd_recv_bwd() # Comm.
-
-    # Run cooldown phase.
-    for i in range(nmb_warmup):
-        recv_bwd_sync() # Comm.
-        bwd_step() # Comp.
-        send_bwd_recv_bwd() # Comm.
-
 if __name__ == "__main__":
     import os
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/asymmetric_multi_chunk")
     # DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
-    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/deepseek")
+    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/nemotron")
 
     partition_path = os.path.join(DEBUG_CONFIG_DIR, "partition.txt")
     placement_path = os.path.join(DEBUG_CONFIG_DIR, "placement.txt")
@@ -1095,6 +995,6 @@ if __name__ == "__main__":
     print(res["max_chunk_num"])
     print(res["stage_num"])
     print(res["did->padded_sids"])
-    # print(res["workloads"][0][:10])
+    print(res["workloads"][0][:10])
     # print_ops(res['workloads'], skip_comp=False,num=20, s=70)
     # print_ops(res['workloads'], s_sid=[6, 14, 22, 30, 7, 15, 23, 31], r_sid=[6, 14, 22, 30, 7, 15, 23, 31], num=90)
