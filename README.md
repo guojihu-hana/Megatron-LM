@@ -2,6 +2,8 @@
 
 # OctoPipe: Reducing Pipeline Bubbles for Heterogeneous Models via Co-Optimizing Partitioning, Placement, and Scheduling
 
+<div align="left">
+
 This fork layers an **OctoPipe** executor on Megatron-LM so you can run **co-optimized** pipeline schedules: irregular **partitioning**, **placement**-aware stage layout, and matching **scheduling** policies.
 
 ### Features (beyond stock Megatron-LM)
