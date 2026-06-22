@@ -27,8 +27,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor, get_pg_rank
-from megatron.training.global_vars import get_octopipe_config, octopipe_enabled
+from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
 
 @dataclass
 class MambaStackSubmodules:
@@ -73,7 +73,6 @@ class MambaStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
-        vp_stage: int,
         residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
@@ -95,7 +94,6 @@ class MambaStack(MegatronModule):
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp
-        self.vp_stage = vp_stage
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -111,94 +109,49 @@ class MambaStack(MegatronModule):
             self.hybrid_override_pattern,
         )
 
+        pp_layer_offset = 0
+        if self.pp_group.size() > 1:
+            pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
+                self.layer_type_list
+            )
+
         self.layers = nn.ModuleList()
-        if octopipe_enabled():
-            octopipe_config = get_octopipe_config()
-            assert vp_stage is not None, "vp_stage should be set when octopipe_config is provided"
-            layer_idx_offset = octopipe_config['layer_idx_offset']
-            layer_idx_start = layer_idx_offset[vp_stage]
-            layer_idx_end = layer_idx_offset[vp_stage + 1]
-            for i, layer_type in enumerate(self.layer_type_list[layer_idx_start:layer_idx_end]):
+        for i, layer_type in enumerate(self.layer_type_list):
+            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+            with fp8_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
-                        layer_number=i + 1 + layer_idx_start,
-                        pp_layer_offset=layer_idx_start,
+                        layer_number=i + 1 + pp_layer_offset,
+                        pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
-                        vp_stage=self.vp_stage,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
+                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.attention_layer,
                         config=self.config,
-                        layer_number=i + 1 + layer_idx_start,
+                        layer_number=i + 1,
                         pg_collection=pg_collection,
-                        vp_stage=self.vp_stage,
                     )
                 elif layer_type == LayerSymbols.MLP:
+                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.mlp_layer,
                         config=self.config,
-                        layer_number=i + 1 + layer_idx_start,
+                        layer_number=i + 1,
                         pg_collection=pg_collection,
-                        vp_stage=self.vp_stage,
                     )
                 elif layer_type == LayerSymbols.MOE:
+                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1 + layer_idx_start,
-                        vp_stage=self.vp_stage,
+                        submodules.moe_layer, config=self.config, layer_number=i + 1
                     )
                 else:
                     assert False, "unexpected layer_type"
-                self.layers.append(layer)
-        else:
-            pp_layer_offset = 0
-            if self.pp_group.size() > 1:
-                pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
-                    self.layer_type_list
-                )
-            for i, layer_type in enumerate(self.layer_type_list):
-                fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
-                with fp8_init_context:
-                    if layer_type == LayerSymbols.MAMBA:
-                        layer = build_module(
-                            submodules.mamba_layer,
-                            config=self.config,
-                            residual_in_fp32=residual_in_fp32,
-                            layer_number=i + 1 + pp_layer_offset,
-                            pp_layer_offset=pp_layer_offset,
-                            pg_collection=pg_collection,
-                            vp_stage=self.vp_stage,
-                        )
-                    elif layer_type == LayerSymbols.ATTENTION:
-                        # Transformer layers apply their own pp_layer_offset
-                        layer = build_module(
-                            submodules.attention_layer,
-                            config=self.config,
-                            layer_number=i + 1,
-                            pg_collection=pg_collection,
-                            vp_stage=self.vp_stage,
-                        )
-                    elif layer_type == LayerSymbols.MLP:
-                        # Transformer layers apply their own pp_layer_offset
-                        layer = build_module(
-                            submodules.mlp_layer,
-                            config=self.config,
-                            layer_number=i + 1,
-                            pg_collection=pg_collection,
-                            vp_stage=self.vp_stage,
-                        )
-                    elif layer_type == LayerSymbols.MOE:
-                        # Transformer layers apply their own pp_layer_offset
-                        layer = build_module(
-                            submodules.moe_layer, config=self.config, layer_number=i + 1,
-                            vp_stage=self.vp_stage,
-                        )
-                    else:
-                        assert False, "unexpected layer_type"
-                self.layers.append(layer)
+            self.layers.append(layer)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -214,23 +167,10 @@ class MambaStack(MegatronModule):
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
 
-        # assert self.config.virtual_pipeline_model_parallel_size is None, (
-        #     "The Mamba hybrid model does not currently support "
-        #     "virtual/interleaved pipeline parallelism"
-        # )
-        vp_size = self.config.virtual_pipeline_model_parallel_size
-        if vp_size is not None and self.config.pipeline_model_parallel_size > 1:
-            assert (
-                num_layers_per_pipeline_rank % vp_size == 0
-            ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
-                should be divisible by vp_size {vp_size}"
-            num_layers_per_virtual_stage = num_layers_per_pipeline_rank // vp_size
-            num_layers_per_pipeline_rank = num_layers_per_virtual_stage
-
-            offset = self.pp_group.rank() * num_layers_per_pipeline_rank + (self.vp_stage * self.pp_group.size() * num_layers_per_pipeline_rank)
-            selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
-
-            return offset, selected_list
+        assert self.config.virtual_pipeline_model_parallel_size is None, (
+            "The Mamba hybrid model does not currently support "
+            "virtual/interleaved pipeline parallelism"
+        )
 
         offset = self.pp_group.rank() * num_layers_per_pipeline_rank
         selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]

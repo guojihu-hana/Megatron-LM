@@ -2,13 +2,10 @@
 
 """Supervised Finetuning GPT."""
 import itertools
-import json
 import os
 import sys
 from functools import partial
-from typing import Any, Dict, Optional
-
-import jsonlines
+from typing import Any, Dict
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
@@ -19,17 +16,17 @@ import transformers
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_ltor_masks_and_position_ids,
-    print_rank_0,
-)
+from megatron.training import get_args, get_timers, pretrain
+from megatron.training.utils import get_ltor_masks_and_position_ids, print_rank_0
+from utils import get_hf_tokenizer
 from model_provider import model_provider
+from megatron.core.parallel_state import get_context_parallel_group
+
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -50,8 +47,7 @@ def get_eos_id():
 
     We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
     we need to replace it with some other special tokens that do not appear in message."""
-    tokenizer = get_tokenizer()
-    hf_tokenizer = tokenizer._tokenizer
+    hf_tokenizer = get_hf_tokenizer()
 
     if hf_tokenizer.eos_token == "<|eot_id|>":
         return 128001
@@ -110,13 +106,21 @@ class SFTDataset(torch.utils.data.Dataset):
         "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
     }
 
+    @classmethod
+    def _wildcard_get(cls, directory: Dict[str, Any], name: str, default_value=None):
+        ret = default_value
+        for key, val in directory.items():
+            if key in name:
+                ret = val
+                break
+        return ret
+
     def __init__(
         self,
         num_packed_samples: int,
-        data_path: Optional[str],
+        hf_dataset: str,
         tokenizer: transformers.PreTrainedTokenizerBase,
         seq_length: int,
-        hf_dataset: Optional[str] = None,
         num_shards: int = 1,
         shard_index: int = 0,
     ):
@@ -129,20 +133,20 @@ class SFTDataset(torch.utils.data.Dataset):
         until the packed dataset has sufficient length.
 
         Args:
-            data_path: Path to the json or jsonl file
             num_packed_samples: total number of packed samples (cyclic access)
-            tokenizer: hf tokenizer
+            hf_dataset: Huggingface dataset name or local path
+            tokenizer: Huggingface PreTrainedTokenizer instance
             seq_length: max sequence length
-            hf_dataset: not supported yet
+            num_shards: number of shards for distributed training
+            shard_index: shard index for distributed training
         """
         if not isinstance(tokenizer, transformers.PreTrainedTokenizerBase):
             raise ValueError("SFTDataset only supports transformers.PreTrainedTokenizerBase!")
 
         self.num_packed_samples = num_packed_samples
-        self.data_path = data_path
+        self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.seq_length = seq_length
-        self.hf_dataset = hf_dataset
         self.data_transformation = lambda data: data
         self.num_shards = num_shards
         self.shard_index = shard_index
@@ -155,42 +159,32 @@ class SFTDataset(torch.utils.data.Dataset):
             REMOVE_THINK_CHAT_TEMPLATE, ""
         )
 
-        if data_path is not None:
-            if data_path.endswith(".json"):
-                self._raw_samples = json.load(open(data_path))
-            elif data_path.endswith(".jsonl"):
-                with jsonlines.open(data_path, mode='r') as reader:
-                    self._raw_samples = [obj for obj in reader]
-            else:
-                raise ValueError("data_path must be json or jsonl")
-        elif self.hf_dataset is not None:
-            hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
-                self.hf_dataset, {"split": "train"}
-            )
-            self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
-            self._raw_samples = self._raw_samples.shard(
-                num_shards=self.num_shards, index=shard_index
-            )
+        hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
+            self.hf_dataset, {"split": "train"}
+        )
+        self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
+        self._raw_samples = self._raw_samples.shard(
+            num_shards=self.num_shards, index=shard_index
+        )
 
-            print(
-                "Rank {:3}/{:3} creates SFT data shard {:3}/{:3} with {:10} raw samples".format(
-                    torch.distributed.get_rank(),
-                    torch.distributed.get_world_size(),
-                    self.shard_index,
-                    self.num_shards,
-                    len(self._raw_samples),
-                ),
-                flush=True,
-            )
-
-        else:
-            raise ValueError("Either hf_dataset or data_path must be provided!")
+        print(
+            "Rank {:3}/{:3} creates SFT data shard {:3}/{:3} with {:10} raw samples".format(
+                torch.distributed.get_rank(),
+                torch.distributed.get_world_size(),
+                self.shard_index,
+                self.num_shards,
+                len(self._raw_samples),
+            ),
+            flush=True,
+        )
 
         if self.tokenizer.chat_template is None:
             self.tokenizer.chat_template = SFTDataset.hf_dataset_to_prompt_template
         elif self.hf_dataset is not None:
-            self.data_transformation = SFTDataset.hf_dataset_to_conversation.get(
-                self.hf_dataset, lambda data: data
+            self.data_transformation = SFTDataset._wildcard_get(
+                SFTDataset.hf_dataset_to_conversation,
+                self.hf_dataset,
+                default_value=lambda data: data,
             )
 
         if self.tokenizer.chat_template is None:
@@ -345,9 +339,8 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     """
     print_rank_0("> building train, validation, and test SFT datasets ...")
     args = get_args()
-    tokenizer = get_tokenizer()
-
-    if not isinstance(tokenizer._tokenizer, transformers.PreTrainedTokenizerBase):
+    hf_tokenizer = get_hf_tokenizer()
+    if not isinstance(hf_tokenizer, transformers.PreTrainedTokenizerBase):
         raise ValueError("SFTDataset only supports transformers.PreTrainedTokenizerBase!")
 
     if args.micro_batch_size > 1:
@@ -361,23 +354,17 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
         kwargs = {
-            "tokenizer": tokenizer._tokenizer,
+            "hf_dataset": args.finetune_hf_dataset,
+            "tokenizer": hf_tokenizer,
             "seq_length": args.seq_length,
             # Optional kwargs
-            "hf_dataset": args.finetune_hf_dataset,
             "num_shards": mpu.get_expert_data_parallel_world_size(),
             "shard_index": mpu.get_expert_data_parallel_rank(),
         }
 
-        data_path = [
-            args.train_data_path[0] if args.train_data_path else None,
-            args.valid_data_path[0] if args.valid_data_path else None,
-            args.test_data_path[0] if args.test_data_path else None,
-        ]
-
-        train_ds = SFTDataset(train_val_test_num_samples[0], data_path[0], **kwargs)
-        valid_ds = SFTDataset(train_val_test_num_samples[1], data_path[1], **kwargs)
-        test_ds = SFTDataset(train_val_test_num_samples[2], data_path[2], **kwargs)
+        train_ds = SFTDataset(train_val_test_num_samples[0], **kwargs)
+        valid_ds = SFTDataset(train_val_test_num_samples[1], **kwargs)
+        test_ds = SFTDataset(train_val_test_num_samples[2], **kwargs)
 
         print_rank_0("> finished creating SFT datasets ...")
 
@@ -446,7 +433,7 @@ def get_batch(data_iterator):
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:args.seq_length]
 
     # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
+    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=get_context_parallel_group())
 
     return batch
 
@@ -454,7 +441,7 @@ def get_batch(data_iterator):
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
-    if not args.export_offline_model:
+    if not args.export_offline_model and args.context_parallel_size == 1:
         try:
             report_draft_acceptance_length(model)
         except Exception as e:
@@ -495,12 +482,18 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 if __name__ == "__main__":
-    pretrain(
-        train_valid_test_sft_datasets_provider,
-        partial(model_provider, modelopt_gpt_mamba_builder),
-        ModelType.encoder_or_decoder,
-        forward_step,
+    from megatron.training.argument_utils import pretrain_cfg_container_from_args
+    from megatron.training.arguments import parse_and_validate_args
+
+    args = parse_and_validate_args(
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
+    )
+    pretrain(
+        pretrain_cfg_container_from_args(args),
+        train_valid_test_sft_datasets_provider,
+        partial(model_provider, modelopt_gpt_hybrid_builder),
+        ModelType.encoder_or_decoder,
+        forward_step,
         non_loss_data_func=non_loss_data_func,
     )

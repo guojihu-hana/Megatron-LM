@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from typing import List, Optional, Tuple, Union
@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
 
 # Types
@@ -184,6 +185,26 @@ class P2PCommunicator:
             else None
         )
 
+    @property
+    def is_pp_first_stage(self) -> bool:
+        """Return True if pp first stage."""
+        return is_pp_first_stage(self.pp_group)
+
+    @property
+    def is_pp_last_stage(self) -> bool:
+        """Return True if pp last stage."""
+        return is_pp_last_stage(self.pp_group)
+
+    @property
+    def total_stages(self) -> int:
+        """Return total number of pipeline stages."""
+        return self.pp_group.size()
+
+    @property
+    def current_stage(self) -> int:
+        """Return current pipeline stage index (0-indexed)."""
+        return self.pp_group.rank()
+
     def _get_global_rank(self, pp_rank: int) -> int:
         return dist.get_global_rank(self.pp_group, pp_rank)
 
@@ -239,22 +260,22 @@ class P2PCommunicator:
             ops = []
             if send_prev_shape_tensor is not None:
                 send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank
+                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(send_prev_op)
             if recv_prev_shape_tensor is not None:
                 recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank
+                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(recv_prev_op)
             if send_next_shape_tensor is not None:
                 send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank
+                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(send_next_op)
             if recv_next_shape_tensor is not None:
                 recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank
+                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(recv_next_op)
             if len(ops) > 0:
@@ -323,13 +344,13 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
-        if not config.variable_seq_lengths:
-            recv_prev_shape = tensor_shape
-            recv_next_shape = tensor_shape
-        else:
+        if config.variable_seq_lengths or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
+        else:
+            recv_prev_shape = tensor_shape
+            recv_next_shape = tensor_shape
 
         def create_tensor_recv_prev():
             return torch.empty(

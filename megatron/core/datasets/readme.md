@@ -9,11 +9,11 @@ Data preprocessing is built around the following classes:
 
 At the moment, an end-to-end data preprocessing implementation is left to the user. See the class docstring(s) for more details.
 
-#### IndexedDatasetBuilder
+### IndexedDatasetBuilder
 
 The `IndexedDatasetBuilder` is capable of building and merging `IndexedDataset` instances.
 
-#### IndexedDataset
+### IndexedDataset
 
 The `IndexedDataset` class is the lowest-level data interface in Megatron Core. Internally, an `IndexedDataset` instance references two binaries: the data file (`.bin`) contains document/sequence data and the index file (`.idx`) contains document/sequence metadata.
 
@@ -42,32 +42,32 @@ Building the data loaders is a distributed-aware process built around the follow
 
 See the class docstrings for more details.
 
-#### BlendedMegatronDatasetConfig (extendable)
+### BlendedMegatronDatasetConfig (extendable)
 
 The `BlendedMegatronDatasetConfig` class parameterizes the `BlendedMegatronDatasetBuilder` and in turn the `MegatronDataset` and `BlendedDataset`.
 
 Different training/inference regimes will require different extensions e.g. the `GPTDatasetConfig`
 
-#### BlendedMegatronDatasetBuilder
+### BlendedMegatronDatasetBuilder
 
 The `BlendedMegatronDatasetBuilder` class builds the highest-level data interfaces in Megatron Core.
 
 **NB:** All ranks should attempt to build the dataset via the `BlendedMegatronDatasetBuilder` or the program will hang. Which ranks follow through on their attempts can be controlled via the `BlendedMegatronDatasetConfig`.
 
-#### IndexedDataset
+### IndexedDataset
 
 The `IndexedDataset` class is the lowest-level data interface in Megatron Core.
 
 The `IndexedDataset` should already exist on disk before attempting to build any of the high-level data interfaces.
 
 
-#### MegatronDataset (extendable)
+### MegatronDataset (extendable)
 
 The `MegatronDataset` abstract class is a high-level data interface in Megatron Core. It is an abstraction built upon the `IndexedDataset`.
 
 Different training/inference regimes will require different extensions e.g. the `GPTDataset`
 
-#### BlendedDataset
+### BlendedDataset
 
 The `BlendedDataset` class is a high-level data interface in Megatron Core. It is an abstraction built upon the `MegatronDataset`.
 
@@ -192,9 +192,21 @@ To query the `BlendedDataset` for the _k_-th sample we do the following
 
 To save time during initialization, each index is built/cached sequentially on one process rank and subsequently loaded in parallel on other process ranks. The cached indices are unique to a hash generated in the `BlendedDataset.__init__` function.
 
+## Offline cache preparation
+
+For GPT-style training, the dataset caches described above can be prepared ahead of time with `tools/prepare_cache.py` instead of waiting for rank 0 to build them during training startup.
+
+The script reuses the normal dataset construction path used by `pretrain_gpt.py` and `pretrain_mamba.py`, including `GPTDataset`, `BlendedDataset`, and `BlendedMegatronDatasetBuilder`. It accepts the usual dataset arguments, supports blends and per-split dataset definitions, and requires `--data-cache-path` so the generated cache can later be reused by training.
+
+This is especially useful for large blends or many file prefixes, where building the document, sample, and shuffle indices can take several minutes and leave all GPUs idle while rank 0 performs CPU-only work.
+
+If the later training job does not specify `--global-batch-size` (which is needed to determine the dataset size and splits), you should specify `--prepare-cache-world-size` to explicitly set the world size used during cache preparation.
+
+`tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`.
+
 ## Fast DataLoader initialization
 
-Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags":
+Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags:
 
   - `--dataloader-fast-cache-load`: This option assumes that the dataset cache already exists in the specified `--data-cache-path`. When enabled, it speeds up the creation process by removing synchronization points and file check assertions.
 

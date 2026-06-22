@@ -50,7 +50,6 @@ PP_LAYOUT="" # Set PP_LAYOUT for implementing Mist
 configs=(
     --num-workers 4
     --mock-data
-    --legacy-tokenizer
     --tensor-model-parallel-size $TP_SIZE
     --pipeline-model-parallel-size $PP_SIZE
     --expert-model-parallel-size $EP_SIZE
