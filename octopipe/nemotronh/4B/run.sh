@@ -1,9 +1,8 @@
 #!/bin/bash
-MODEL_NAME=nemotronh
 MODEL_SIZE=4B
 TIME=$1
 
-export MODEL="${MODEL_NAME}-${MODEL_SIZE}"
+export MODEL="nemotronh-4B"
 export MASTER_ADDR=${MASTER_ADDR}
 export GPUS_PER_NODE=$PROC_PER_NODE
 export MASTER_PORT=6001
@@ -14,7 +13,6 @@ export PP_MODE=$PP_MODE
 # NVSHMEM PP P2P (schedules.NvshmemP2PCommunicator): export MEGATRON_NVSHMEM_P2P=1 before run
 export MEGATRON_NVSHMEM_P2P=${MEGATRON_NVSHMEM_P2P:-0}
 export NVSHMEM_REMOTE_TRANSPORT=${NVSHMEM_REMOTE_TRANSPORT:-none}
-export MEGATRON_NVSHMEM_TRACE_MAX=-1
 
 if [ -n "$TIME" ]; then
     echo "Time set to: $TIME"
@@ -43,20 +41,19 @@ export PYTHONWARNINGS="ignore"
 # export NCCL_DEBUG="INFO"
 # export TORCHDYNAMO_DISABLE=1 # 不禁用会报错 但不影响运行
 
-_RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$_RUN_DIR/../../../.."
-source $_RUN_DIR/config.sh
-source $_RUN_DIR/model_args.sh
+cd /mnt/shared-storage-user/ailab-sys/guojihu/Megatron-LM
+source sh/nemotronh/$MODEL_SIZE/config.sh
+source sh/nemotronh/$MODEL_SIZE/model_args.sh
 
 # conda
-# source "${CONDA_ROOT:-$HOME/miniconda3}/etc/profile.d/conda.sh"
-TRAIN_FILE="$_RUN_DIR/../../../pretrain_mamba.py"
+# source /mnt/shared-storage-user/ailab-sys/guojihu/miniconda/etc/profile.d/conda.sh
+TRAIN_FILE=/mnt/shared-storage-user/ailab-sys/guojihu/Megatron-LM/Megatron-LM/pretrain_mamba.py
 
 # profile stage time
 # export CUDA_LAUNCH_BLOCKING=1
-# export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-TENSORBOARD_DIR="traces/${TIME}/${LOG_DIR_NAME}/"
+TENSORBOARD_DIR=/mnt/shared-storage-user/ailab-sys/guojihu/Megatron-LM/traces/${TIME}/${LOG_DIR_NAME}/
 configs+=(--tensorboard-dir $TENSORBOARD_DIR)
 
 torchrun --nnodes $NNODES --nproc-per-node $GPUS_PER_NODE --node_rank $NODE_RANK --master-port $MASTER_PORT --master-addr $MASTER_ADDR $TRAIN_FILE \
@@ -64,4 +61,4 @@ torchrun --nnodes $NNODES --nproc-per-node $GPUS_PER_NODE --node_rank $NODE_RANK
     ${MODEL_ARGS[@]} \
     ${MOE_ARGS[@]} \
     ${LOG_ARGS[@]} \
-    2>&1 | tee $_RUN_DIR/results/$TIME.log
+    2>&1 | tee sh/nemotronh/$MODEL_SIZE/results/$TIME.log

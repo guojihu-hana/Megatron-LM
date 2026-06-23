@@ -4,6 +4,7 @@ import tempfile
 import yaml
 
 from octopipe.generate_inst import (
+    build_octopipe_config,
     get_octopipe_config,
     get_octopipe_config_from_yaml,
     read_octopipe_yaml,
@@ -33,6 +34,20 @@ def test_read_octopipe_yaml_accepts_tuple_strings():
         assert scheduling[1]["type"] == "b"
     finally:
         os.remove(yaml_path)
+
+
+def test_build_octopipe_config_preserves_w_workloads():
+    config = build_octopipe_config(
+        partition=[1],
+        placement=[[0]],
+        scheduling=[
+            {"op": "comp", "type": "b", "mid": 0, "sid": 0, "did": 0, "start_time": 0.0, "end_time": 1.0},
+            {"op": "comp", "type": "w", "mid": 0, "sid": 0, "did": 0, "start_time": 1.0, "end_time": 2.0},
+        ],
+    )
+
+    workload_types = [workload["type"] for workload in config["workloads"][0]]
+    assert workload_types == ["b", "w"]
 
 
 def test_yaml_config_matches_txt_config_for_nemotron_debug():

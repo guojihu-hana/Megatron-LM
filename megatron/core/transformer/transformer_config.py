@@ -2507,8 +2507,11 @@ class TransformerConfig(ModelParallelConfig):
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
             assert (
-                self.overlap_moe_expert_parallel_comm
-            ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
+                self.overlap_moe_expert_parallel_comm or self.octopipe_bwd_splitting
+            ), (
+                'overlap_moe_expert_parallel_comm or octopipe_bwd_splitting must be '
+                'enabled when enabling delay_wgrad_compute'
+            )
             if self.cuda_graph_impl == "transformer_engine":
                 assert is_te_min_version("2.10.0"), (
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '

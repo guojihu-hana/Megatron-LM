@@ -1,25 +1,36 @@
 
 import queue
+from contextlib import contextmanager
+
 # from megatron.training import get_args
 # from megatron.core import parallel_state
-from contextlib import contextmanager
 
 class WeightGradStore:
 
     should_split_bw = False
-    cache = []
+    cache = {}
     weight_grad_queue = None  # lazy init
 
     @classmethod
-    def lazy_init(cls):
-        if cls.weight_grad_queue is not None:
-            return
+    def lazy_init(cls, num_chunks=1, num_seq_splits=1):
         # Lazy init to make sure parallel_state and get_args() have been initialized.
         # num_chunks = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
-        num_chunks = 1
-        # chunk id => seq id => Queue
-        num_seq_splits = 1
-        cls.weight_grad_queue = [[queue.Queue() for _ in range(num_seq_splits)] for _ in range(num_chunks)]
+        if cls.weight_grad_queue is None:
+            cls.weight_grad_queue = []
+        while len(cls.weight_grad_queue) < num_chunks:
+            cls.weight_grad_queue.append([])
+        for chunk_queues in cls.weight_grad_queue:
+            while len(chunk_queues) < num_seq_splits:
+                chunk_queues.append(queue.Queue())
+
+    @classmethod
+    def _ensure_queue(cls, chunk=0, seq_split_idx=0):
+        cls.lazy_init(num_chunks=chunk + 1, num_seq_splits=seq_split_idx + 1)
+        return cls.weight_grad_queue[chunk][seq_split_idx]
+
+    @staticmethod
+    def _cache_key(chunk=0, seq_split_idx=0):
+        return chunk, seq_split_idx
 
     @classmethod
     def is_supported(cls):
@@ -66,59 +77,72 @@ class WeightGradStore:
     @classmethod
     def put(cls, weight, pre_func, func):
         assert cls.split_bw()
-        # func(*pre_func(async_op=False))
-        cls.cache.append((weight, pre_func, func))
+        cls.put_task(
+            lambda: func(*pre_func(async_op=False)),
+            description=getattr(weight, "shape", None),
+        )
         return
 
     @classmethod
+    def put_task(cls, task, description=None, chunk=0, seq_split_idx=0):
+        """Cache a delayed weight-gradient task for the current bwd split."""
+        assert cls.split_bw()
+        if not callable(task):
+            raise TypeError("WeightGradStore task must be callable")
+        key = cls._cache_key(chunk, seq_split_idx)
+        cls.cache.setdefault(key, []).append((task, description))
+
+    @classmethod
     def queue_size(cls, chunk=0, seq_split_idx=0):
-        cls.lazy_init()
-        return WeightGradStore.weight_grad_queue[chunk][seq_split_idx].qsize()
+        return cls._ensure_queue(chunk, seq_split_idx).qsize()
 
     @classmethod
     def flush(cls, chunk=0, seq_split_idx=0):
-        cls.lazy_init()
+        cls._ensure_queue(chunk, seq_split_idx)
         # Or W later will consume empty computation and leak the non-empty computation.
         if not cls.split_bw():
-            assert len(cls.cache) == 0
+            assert all(len(tasks) == 0 for tasks in cls.cache.values())
             return
-        cls.weight_grad_queue[chunk][seq_split_idx].put(cls.cache)
-        cls.cache = []
+        key = cls._cache_key(chunk, seq_split_idx)
+        tasks = cls.cache.pop(key, [])
+        if tasks:
+            cls.weight_grad_queue[chunk][seq_split_idx].put(tasks)
 
     @classmethod
-    def pop(cls, chunk=0, seq_split_idx=0):
-        cls.lazy_init()
-        if cls.weight_grad_queue[chunk][seq_split_idx].qsize() > 0:
-            stored_grads = cls.weight_grad_queue[chunk][seq_split_idx].get()
-            for weight, pre_func, func in stored_grads:
-                func(*pre_func(async_op=False))
-        # else:
-        #     rank = parallel_state.get_pipeline_model_parallel_rank()
-        #     raise Exception(f"Pop empty queue. rank {rank}")
+    def pop(cls, chunk=0, seq_split_idx=0, strict=True):
+        q = cls._ensure_queue(chunk, seq_split_idx)
+        if q.qsize() == 0:
+            if strict and cls.split_bw():
+                raise RuntimeError(
+                    f"WeightGradStore pop on empty queue "
+                    f"(chunk={chunk}, seq_split_idx={seq_split_idx})"
+                )
+            return
+        stored_tasks = q.get()
+        for task, _description in stored_tasks:
+            task()
 
     @classmethod
-    def clear(cls, model, chunk=0, seq_split_idx=0):
-        cls.lazy_init()
-        weight_grad_tasks = []
-        while cls.weight_grad_queue[chunk][seq_split_idx].qsize() > 0:
-            stored_grads = cls.weight_grad_queue[chunk][seq_split_idx].get()
-            if len(weight_grad_tasks) == 0:
-                for _ in stored_grads:
-                    weight_grad_tasks.append([])
-            else:
-                assert len(weight_grad_tasks) == len(stored_grads)
-            for i, task in enumerate(stored_grads):
-                weight_grad_tasks[i].append(task)
+    def pending_count(cls, chunk=0, seq_split_idx=0):
+        q = cls._ensure_queue(chunk, seq_split_idx)
+        key = cls._cache_key(chunk, seq_split_idx)
+        return q.qsize() + int(bool(cls.cache.get(key)))
 
-        for i in range(len(weight_grad_tasks)):
-            tasks = weight_grad_tasks[i]
-            param = None
-            for j in range(len(tasks)):
-                weight, pre_func, func = tasks[j]
-                if param is None:
-                    param = weight
-                assert param.storage().data_ptr() == weight.storage().data_ptr()
-                func(*pre_func(async_op=False))
-                tasks[j] = None  # release memory
-            
-            weight_grad_tasks[i] = None  # release memory
+    @classmethod
+    def reset(cls):
+        cls.should_split_bw = False
+        cls.cache = {}
+        cls.weight_grad_queue = None
+
+    @classmethod
+    def clear(cls, model=None, chunk=0, seq_split_idx=0):
+        """Drain all queued and cached tasks for a chunk."""
+        q = cls._ensure_queue(chunk, seq_split_idx)
+        while q.qsize() > 0:
+            stored_tasks = q.get()
+            for task, _description in stored_tasks:
+                task()
+
+        key = cls._cache_key(chunk, seq_split_idx)
+        for task, _description in cls.cache.pop(key, []):
+            task()

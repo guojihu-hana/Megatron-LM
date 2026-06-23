@@ -380,6 +380,8 @@ def core_config_from_args(args, dataclass=TransformerConfig):
     for f in dataclasses.fields(dataclass):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+        elif f.name == "octopipe_bwd_splitting":
+            kw_args[f.name] = False
         else:
             raise Exception(f"Missing argument {f.name} for {str(dataclass)} config")
     return kw_args

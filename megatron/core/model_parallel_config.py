@@ -272,6 +272,9 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    octopipe_bwd_splitting: bool = False
+    """Use OctoPipe workloads to split backward into dgrad (b) and wgrad (w) phases."""
+
     overlap_dispatch_backward_with_experts_wgrad: bool = False
     """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
     When enabled with FSDP, the expert weight gradients are computed on a separate

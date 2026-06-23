@@ -10,6 +10,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.enums import ModelType
 from megatron.core.weight_gradient_store import WeightGradStore
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -583,6 +584,61 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
         config.timers('backward-compute').stop()
 
     return input_tensor_grad
+
+
+def _prepare_octopipe_bwd_splitting(config, workloads):
+    """Initialize WeightGradStore for OctoPipe backward splitting."""
+    WeightGradStore.reset()
+    if not getattr(config, "octopipe_bwd_splitting", False):
+        return False
+
+    has_w_workload = any(
+        workload.get("op") == "comp" and workload.get("type") == "w" for workload in workloads
+    )
+    if not has_w_workload:
+        raise ValueError(
+            "--octopipe-bwd-splitting requires at least one 'w' workload in the OctoPipe schedule."
+        )
+
+    WeightGradStore.enable_split_bw()
+    return True
+
+
+def _register_octopipe_wgrad_task(model_chunk, chunk=0):
+    """Queue the chunk-level TE delayed weight-gradient computation."""
+    if not WeightGradStore.split_bw():
+        return
+    backward_dw_modules = _collect_octopipe_backward_dw_modules(model_chunk)
+    if not backward_dw_modules:
+        raise RuntimeError(
+            "--octopipe-bwd-splitting requires model chunks to contain modules "
+            "that expose backward_dw()."
+        )
+
+    def run_backward_dw():
+        for module in reversed(backward_dw_modules):
+            module.backward_dw()
+
+    description = ",".join(type(module).__name__ for module in backward_dw_modules)
+    WeightGradStore.put_task(run_backward_dw, description=description, chunk=chunk)
+    WeightGradStore.flush(chunk=chunk)
+
+
+def _collect_octopipe_backward_dw_modules(model_chunk):
+    """Return top-level modules whose backward_dw should be called for a chunk."""
+    modules = list(get_attr_wrapped_model(model_chunk, "modules")())
+    selected = []
+    skipped_descendants = set()
+    for module in modules:
+        module_id = id(module)
+        if module_id in skipped_descendants:
+            continue
+        backward_dw = getattr(module, "backward_dw", None)
+        if not callable(backward_dw):
+            continue
+        selected.append(module)
+        skipped_descendants.update(id(descendant) for descendant in module.modules())
+    return selected
 
 
 def backward_step_multimodule(
@@ -2644,8 +2700,6 @@ def forward_backward_pipelining_of_octopipe(
     if config.num_microbatches_with_partial_activation_checkpoints is not None:
         max_outstanding_backprops = num_warmup_microbatches + 1
 
-    model_type = get_model_type(model[0])
-
     rank = p2p_communicator.pp_group.rank()
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2707,12 +2761,9 @@ def forward_backward_pipelining_of_octopipe(
 
     forward_data_store = []
 
-    WeightGradStore.split_bw = False
-    for workload in workloads:
-        wtype = workload['type']
-        if wtype == 'w':
-            WeightGradStore.split_bw = True
-            break
+    octopipe_bwd_splitting = (
+        _prepare_octopipe_bwd_splitting(config, workloads) if not forward_only else False
+    )
 
     for wid, workload in enumerate(workloads):
         # print(f"PP {pp_rank} bgn {wid}, {workload}", flush=True)
@@ -2786,17 +2837,20 @@ def forward_backward_pipelining_of_octopipe(
                 output_tensor = output_tensors[mid][sid]
 
                 input_tensor_grad = backward_step(
-                    input_tensor, output_tensor, output_tensor_grad, model_type, config
+                    input_tensor, output_tensor, output_tensor_grad, config
                 )
-                if WeightGradStore.split_bw:
-                    WeightGradStore.flush()
+                if octopipe_bwd_splitting:
+                    _register_octopipe_wgrad_task(model[cid], chunk=cid)
 
                 input_tensor_grads[mid][sid] = input_tensor_grad
             elif wtype == 'w':
-                # NOTE: should support backward-splitting
                 # NOTE: W only FIFO execution order
-                WeightGradStore.pop()
-                pass
+                if not octopipe_bwd_splitting:
+                    raise ValueError(
+                        "OctoPipe schedule contains a 'w' workload, but "
+                        "--octopipe-bwd-splitting is disabled."
+                    )
+                WeightGradStore.pop(chunk=cid)
             else:
                 raise ValueError(f"{op} Workload Type Error: {wtype}")
 
@@ -2856,6 +2910,16 @@ def forward_backward_pipelining_of_octopipe(
             raise ValueError(f"Op Type Error: {op}")
         # print(f"PP {pp_rank} end {wid}, {workload}", flush=True)
 
+    if octopipe_bwd_splitting:
+        pending_chunks = [
+            chunk for chunk in range(len(model)) if WeightGradStore.pending_count(chunk=chunk) > 0
+        ]
+        if pending_chunks:
+            raise RuntimeError(
+                "OctoPipe backward splitting left pending WeightGradStore tasks "
+                f"for chunks {pending_chunks}; check b/w workload balance."
+            )
+
     if not forward_only:
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
@@ -2884,6 +2948,9 @@ def forward_backward_pipelining_of_octopipe(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
+
+    if octopipe_bwd_splitting:
+        WeightGradStore.reset()
 
     if (
         hasattr(config, 'cuda_graph_impl')

@@ -1080,17 +1080,23 @@ def print_ops(workload_comp_comm_order, skip_comp=True, s_sid:list=[], r_sid:lis
         print()
 
 if __name__ == "__main__":
-    import os
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/asymmetric_multi_chunk")
-    # DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
-    DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/nemotron")
+    test_yaml = True
+    if test_yaml:
+        partition, placement, scheduling = read_octopipe_yaml(yaml_path="sh/nemotronh/4B/octopipe_config.yaml")
+        res = build_octopipe_config(partition, placement, scheduling)
+        print_ops(res["workloads"], skip_comp=False, num=10, s=0)
+    else:
+        import os
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/asymmetric_multi_chunk")
+        # DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/single_chunk")
+        DEBUG_CONFIG_DIR = os.path.join(BASE_DIR, "debug_config/nemotron")
 
-    partition_path = os.path.join(DEBUG_CONFIG_DIR, "partition.txt")
-    placement_path = os.path.join(DEBUG_CONFIG_DIR, "placement.txt")
-    results_path = os.path.join(DEBUG_CONFIG_DIR, "result.txt")
-    # Example:
-    res = get_octopipe_config(partition_path=partition_path,placement_path=placement_path,results_path=results_path)
+        partition_path = os.path.join(DEBUG_CONFIG_DIR, "partition.txt")
+        placement_path = os.path.join(DEBUG_CONFIG_DIR, "placement.txt")
+        results_path = os.path.join(DEBUG_CONFIG_DIR, "result.txt")
+        # Example:
+        res = get_octopipe_config(partition_path=partition_path,placement_path=placement_path,results_path=results_path)
     print(res["sid->did"])
     print(res["did->sid"])
     print(res["sid->cid"])
@@ -1098,6 +1104,6 @@ if __name__ == "__main__":
     print(res["max_chunk_num"])
     print(res["stage_num"])
     print(res["did->padded_sids"])
-    print(res["workloads"][0][:10])
+    print(res["workloads"][1][:10])
     # print_ops(res['workloads'], skip_comp=False,num=20, s=70)
     # print_ops(res['workloads'], s_sid=[6, 14, 22, 30, 7, 15, 23, 31], r_sid=[6, 14, 22, 30, 7, 15, 23, 31], num=90)

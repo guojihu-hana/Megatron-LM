@@ -1,4 +1,6 @@
 #!/bin/bash
+# srun --job-name=megatron --nodes=1 --ntasks-per-node=1 --gpus-per-task=8 --cpus-per-task=8 --time=0:10:0 --partition=llm_s 脚本.sh
+GPUS_PER_TASK=8
 JOB=NEMOTRONH
 LOG_DIR_NAME="${JOB}"
 # RuntimeError: Using async gradient all reduce requires setting the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1
@@ -15,44 +17,43 @@ MOE_FREQ=1
 EP_SIZE=1
 PP_SIZE=4
 TP_SIZE=1
+
 MOE_FFN_SIZE=$((1024*1))
 SEQ_LEN=$((1024 * 4))
-GLOBAL_BATCH_SIZE=$((2 * $PP_SIZE))
-TRAIN_ITERS=20
+MICRO_BATCH_SIZE=1   # global batch size = microbatch num * microbatch size * dp
+GLOBAL_BATCH_SIZE=8 # 不设置时默认=microbatch size * dp，此时 microbatch num=1 
+TRAIN_ITERS=100
 EVAL_ITERS=0
 EVAL_INTERVAL=1
 LOG_INTERVAL=1
+OVERLAP_WARMUP_FLUSH=""
+VPP="" # 不设置时默认为空，不为空时表示vpp的layer数 
 
-# Recomputation settings
 RECOMP_GRANULARITY="" # 空串时不重计算 非空时可选：[selective, full]
 RECOMP_METHOD="uniform"
 RECOMP_LAYER=1
-
-PP_MODE="octopipe" # 1f1b, octopipe
-
-# OctoPipe settings
+PP_MODE="octopipe"
+PP_MODE="1f1b"
+OCTOPIPE_BWD_SPLITTING=True # 使用OctoPipe workloads来拆分backward into dgrad (b) and wgrad (w) phases.
 OCTOPIPE_CONFIG_DIR="debug_config/nemotron"
+OCTOPIPE_CONFIG_YAML="sh/nemotronh/4B/octopipe_config.yaml"
 
-# 1F1B settings
-VPP="" # set to 1 to enable Interleaved-1F1B
-if [ "$PP_MODE" = "octopipe" ]; then
-    VPP=""
-fi
-PP_LAYOUT="" # Set PP_LAYOUT for implementing Mist
 
-# 'A string that describes a custom pipeline model parallel layout. '
-# 'e.g., "E|(t|)*3,m|m||L". E, L, t, m denotes embedding, loss, transformer '
-# 'decoder layer, and mtp layer, respectively. Stages are split by "|". '
-# 'Replicated stages or layers can be described with multiplication. '
-# 'Commas can be used cosmetically. '
-# 'Default None is not using this argument to set the layout.'
+# --pipeline-model-parallel-layout 
+PP_LAYOUT="E,t*4|t*4|t*4|t*4|t*4|t*4|t*4|t*4,L" 
+PP_LAYOUT="Et|(t|)*30tL"
+PP_LAYOUT=""
 
+# MoE do not support fp16 (change to bf16), bias linear (disable bias linear)
+# --data-path /cpfs01/user/guojihu/MegatronLM/Megatron-LM/dataset/data/gpt2_pretrain_text_document \
 configs=(
     --num-workers 4
     --mock-data
     --tensor-model-parallel-size $TP_SIZE
     --pipeline-model-parallel-size $PP_SIZE
     --expert-model-parallel-size $EP_SIZE
+    # --vocab-file /mnt/shared-storage-user/ailab-sys/guojihu/Megatron-LM/data/gpt2-vocab.json
+    # --merge-file /mnt/shared-storage-user/ailab-sys/guojihu/Megatron-LM/data/gpt2-merges.txt
     --global-batch-size $GLOBAL_BATCH_SIZE
     --train-iters $TRAIN_ITERS
     --lr-decay-iters 320000
@@ -82,7 +83,8 @@ LOG_ARGS=(
     --eval-interval $EVAL_INTERVAL
     --log-throughput
     --profile
-    --profile-ranks 0 1 2 3 4 5 6 7
+    # --profile-layer-time
+    --profile-ranks 0 1 2 3
     --use-pytorch-profiler
     --profile-step-start 5
     --profile-step-end 6
@@ -131,11 +133,15 @@ if [ "$PP_SIZE" -gt 1 ]; then
     fi
 
     if [ -n "$PP_LAYOUT" ]; then
-        configs+=(--pipeline-model-parallel-layout $PP_LAYOUT)
+        configs+=(--pipeline-model-parallel-layout "$PP_LAYOUT")
     fi
 
     if [ "$PP_MODE" = "octopipe" ]; then
         configs+=(--octopipe)
-        configs+=(--octopipe-config-dir $OCTOPIPE_CONFIG_DIR)
+        if [ "$OCTOPIPE_BWD_SPLITTING" = "True" ]; then
+            configs+=(--octopipe-bwd-splitting)
+        fi
+        # configs+=(--octopipe-config-dir $OCTOPIPE_CONFIG_DIR)
+        configs+=(--octopipe-config-yaml $OCTOPIPE_CONFIG_YAML)
     fi
 fi

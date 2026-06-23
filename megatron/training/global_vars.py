@@ -26,6 +26,8 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_OCTOPIPE_CONFIG = None
+_GLOBAL_OCTOPIPE_CONFIG_KEY = None
 
 def get_args():
     """Return arguments."""
@@ -172,6 +174,8 @@ def unset_global_variables():
     global _GLOBAL_TIMERS
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
+    global _GLOBAL_OCTOPIPE_CONFIG
+    global _GLOBAL_OCTOPIPE_CONFIG_KEY
 
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -183,13 +187,19 @@ def unset_global_variables():
     _GLOBAL_TIMERS = None
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
+    _GLOBAL_OCTOPIPE_CONFIG = None
+    _GLOBAL_OCTOPIPE_CONFIG_KEY = None
 
     unset_num_microbatches_calculator()
 
 
 def set_args(args):
     global _GLOBAL_ARGS
+    global _GLOBAL_OCTOPIPE_CONFIG
+    global _GLOBAL_OCTOPIPE_CONFIG_KEY
     _GLOBAL_ARGS = args
+    _GLOBAL_OCTOPIPE_CONFIG = None
+    _GLOBAL_OCTOPIPE_CONFIG_KEY = None
 
 
 def _build_tokenizer(args):
@@ -350,6 +360,12 @@ def destroy_global_vars():
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
 
+    global _GLOBAL_OCTOPIPE_CONFIG
+    _GLOBAL_OCTOPIPE_CONFIG = None
+
+    global _GLOBAL_OCTOPIPE_CONFIG_KEY
+    _GLOBAL_OCTOPIPE_CONFIG_KEY = None
+
 def octopipe_enabled():
     """Return true if octopipe is enabled."""
     args = get_args()
@@ -357,8 +373,11 @@ def octopipe_enabled():
 
 def get_octopipe_config():
     """Return octopipe config."""
+    global _GLOBAL_OCTOPIPE_CONFIG
+    global _GLOBAL_OCTOPIPE_CONFIG_KEY
+
     args = get_args()
-    if not hasattr(args, 'octopipe'):
+    if not getattr(args, 'octopipe', False):
         return None
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
@@ -371,23 +390,34 @@ def get_octopipe_config():
     yaml_path = getattr(args, 'octopipe_config_yaml', None)
     if yaml_path:
         resolved_yaml = _resolve_octopipe_config_path(yaml_path, project_root)
-        return get_octopipe_config_from_yaml(resolved_yaml)
+        cache_key = ("yaml", resolved_yaml)
+        if _GLOBAL_OCTOPIPE_CONFIG_KEY == cache_key:
+            return _GLOBAL_OCTOPIPE_CONFIG
+        _GLOBAL_OCTOPIPE_CONFIG = get_octopipe_config_from_yaml(resolved_yaml)
+        _GLOBAL_OCTOPIPE_CONFIG_KEY = cache_key
+        return _GLOBAL_OCTOPIPE_CONFIG
 
     if not args.octopipe_config_dir:
         raise ValueError(
             '--octopipe requires --octopipe-config-yaml or --octopipe-config-dir.'
         )
 
+    cache_key = ("dir", args.octopipe_config_dir)
+    if _GLOBAL_OCTOPIPE_CONFIG_KEY == cache_key:
+        return _GLOBAL_OCTOPIPE_CONFIG
+
     octopipe_config_dir = os.path.join(project_root, "octopipe", args.octopipe_config_dir)
     partition_path = os.path.join(octopipe_config_dir, "partition.txt")
     placement_path = os.path.join(octopipe_config_dir, "placement.txt")
     results_path = os.path.join(octopipe_config_dir, "result.txt")
 
-    return goc(
+    _GLOBAL_OCTOPIPE_CONFIG = goc(
         partition_path=partition_path,
         placement_path=placement_path,
         results_path=results_path,
     )
+    _GLOBAL_OCTOPIPE_CONFIG_KEY = cache_key
+    return _GLOBAL_OCTOPIPE_CONFIG
 
 
 def _resolve_octopipe_config_path(config_path: str, project_root: str) -> str:

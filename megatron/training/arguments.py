@@ -909,6 +909,17 @@ def validate_args(args, defaults={}):
                 '--octopipe requires --octopipe-config-yaml or --octopipe-config-dir.'
             )
 
+    if getattr(args, 'octopipe_bwd_splitting', False):
+        if not getattr(args, 'octopipe', False):
+            raise ValueError('--octopipe-bwd-splitting requires --octopipe.')
+        if args.transformer_impl != 'transformer_engine':
+            raise ValueError(
+                '--octopipe-bwd-splitting requires --transformer-impl transformer_engine.'
+            )
+        if args.cuda_graph_impl != 'none':
+            raise ValueError('--octopipe-bwd-splitting does not support CUDA graph capture yet.')
+        args.delay_wgrad_compute = True
+
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -2138,6 +2149,7 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        "octopipe_bwd_splitting",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2589,6 +2601,10 @@ def _add_training_args(parser):
     group.add_argument('--octopipe-config-yaml', type=str, default=None,
                        help='Path to an OctoPipe YAML config with partition, placement, '
                        'and scheduling fields. Mutually exclusive with --octopipe-config-dir.')
+    group.add_argument('--octopipe-bwd-splitting', action='store_true',
+                       help='Enable OctoPipe backward splitting. Requires TransformerEngine; '
+                       'OctoPipe b workloads compute dgrad while w workloads execute delayed '
+                       'TransformerEngine weight-gradient computation.')
     group.add_argument('--profile-layer-time', action='store_true',
                        help='Profile per-layer compute times by incrementally solving '
                        'a linear system from pipeline stage timings. Results are '
