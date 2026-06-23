@@ -1396,7 +1396,7 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.octopipe:
+    if getattr(args, 'octopipe', False):
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
@@ -1478,7 +1478,7 @@ def pretrain(
         )
 
         octopipe_partition = None
-        if args.octopipe:
+        if getattr(args, 'octopipe', False):
             octopipe_config = get_octopipe_config()
             octopipe_partition = octopipe_config['partition']
 
@@ -1599,8 +1599,9 @@ def pretrain(
                 or os.path.join(pp_timing_dir, "layer_times.json")
             )
             octopipe_partition = None
-            if args.octopipe:
+            if getattr(args, 'octopipe', False):
                 octopipe_partition = get_octopipe_config()['partition']
+
             partition, stage_num, layout_mode = derive_stage_layout(
                 hybrid_layer_pattern=args.hybrid_layer_pattern,
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
@@ -1608,6 +1609,7 @@ def pretrain(
                 decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
                 octopipe_partition=octopipe_partition,
             )
+            
             json_path = solve_and_dump_layer_times(
                 partition=partition,
                 hybrid_layer_pattern=args.hybrid_layer_pattern,
@@ -2518,11 +2520,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             p2p_communicator=p2p_communicator,
             pg_collection=schedule_pg_collection,
         )
+        
         if getattr(args, 'octopipe', False):
-            if not hasattr(train_step, "_octopipe_initialized"):
-                train_step.octopipe_config = get_octopipe_config()
-                train_step._octopipe_initialized = True
-            forward_backward_kwargs['octopipe_config'] = train_step.octopipe_config
+            forward_backward_kwargs['octopipe_config'] = get_octopipe_config()
 
         losses_reduced = forward_backward_func(**forward_backward_kwargs)
 
