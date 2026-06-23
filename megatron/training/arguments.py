@@ -890,6 +890,25 @@ def validate_args(args, defaults={}):
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
+    if getattr(args, 'profile_layer_time', False):
+        if args.hybrid_layer_pattern is None:
+            raise ValueError(
+                '--profile-layer-time requires --hybrid-layer-pattern to count per-stage '
+                'layer types.'
+            )
+
+    if getattr(args, 'octopipe', False):
+        has_yaml = bool(getattr(args, 'octopipe_config_yaml', None))
+        has_dir = bool(getattr(args, 'octopipe_config_dir', None))
+        if has_yaml and has_dir:
+            raise ValueError(
+                'Cannot specify both --octopipe-config-yaml and --octopipe-config-dir.'
+            )
+        if not has_yaml and not has_dir:
+            raise ValueError(
+                '--octopipe requires --octopipe-config-yaml or --octopipe-config-dir.'
+            )
+
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -2565,7 +2584,24 @@ def _add_training_args(parser):
     group.add_argument('--octopipe', action='store_true',
                        help='Enable OctoPipe for pipeline parallelism')
     group.add_argument('--octopipe-config-dir', type=str, default=None,
-                       help='OctoPipe config dir path.')
+                       help='OctoPipe config dir path under octopipe/. '
+                       'Must contain partition.txt, placement.txt, and result.txt.')
+    group.add_argument('--octopipe-config-yaml', type=str, default=None,
+                       help='Path to an OctoPipe YAML config with partition, placement, '
+                       'and scheduling fields. Mutually exclusive with --octopipe-config-dir.')
+    group.add_argument('--profile-layer-time', action='store_true',
+                       help='Profile per-layer compute times by incrementally solving '
+                       'a linear system from pipeline stage timings. Results are '
+                       'accumulated in layer_times.json across runs.')
+    group.add_argument('--profile-layer-time-output', type=str, default=None,
+                       help='Output JSON path for solved layer times. '
+                       'Defaults to pp_timing/{MODEL}/layer_times.json.')
+    group.add_argument('--profile-layer-time-warmup-iters', type=int, default=5,
+                       help='Skip the first N training iterations when averaging '
+                       'pp stage timings for layer-time profiling.')
+    group.add_argument('--reset-profiled-layer-time', action='store_true',
+                       help='When profiling layer times, ignore existing layer_times.json '
+                       'and recompute from scratch instead of incrementally extending it.')
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '

@@ -282,6 +282,7 @@ def dump_pp_timing_to_json(
 ):
     args = get_args()
     train_iters = args.train_iters
+    warmup_iters = max(getattr(args, 'profile_layer_time_warmup_iters', 0), 0)
 
     def group_by_vp_stage(events):
         grouped = defaultdict(list)
@@ -303,13 +304,16 @@ def dump_pp_timing_to_json(
         fwd_steps_per_iter = len(fwd_times) // train_iters if train_iters > 0 else 0
         bwd_steps_per_iter = len(bwd_times) // train_iters if train_iters > 0 else 0
 
-        fwd_exc_1 = (
-            fwd_times[fwd_steps_per_iter:]
-            if fwd_steps_per_iter > 0 else fwd_times
+        skip_fwd = fwd_steps_per_iter * warmup_iters
+        skip_bwd = bwd_steps_per_iter * warmup_iters
+
+        fwd_exc_warmup = (
+            fwd_times[skip_fwd:]
+            if skip_fwd > 0 else fwd_times
         )
-        bwd_exc_1 = (
-            bwd_times[bwd_steps_per_iter:]
-            if bwd_steps_per_iter > 0 else bwd_times
+        bwd_exc_warmup = (
+            bwd_times[skip_bwd:]
+            if skip_bwd > 0 else bwd_times
         )
 
         vp_stage_stats[vp_stage] = {
@@ -322,10 +326,10 @@ def dump_pp_timing_to_json(
                 sum(bwd_times) / len(bwd_times) if bwd_times else 0.0
             ),
             "forward_avg_ms_exc_1": (
-                sum(fwd_exc_1) / len(fwd_exc_1) if fwd_exc_1 else 0.0
+                sum(fwd_exc_warmup) / len(fwd_exc_warmup) if fwd_exc_warmup else 0.0
             ),
             "backward_avg_ms_exc_1": (
-                sum(bwd_exc_1) / len(bwd_exc_1) if bwd_exc_1 else 0.0
+                sum(bwd_exc_warmup) / len(bwd_exc_warmup) if bwd_exc_warmup else 0.0
             ),
         }
 
@@ -336,6 +340,7 @@ def dump_pp_timing_to_json(
     data = {
         "pp_rank": pp_rank,
         "train_iters": train_iters,
+        "warmup_iters_skipped": warmup_iters,
         "vp_stages": vp_stage_stats,
     }
 
@@ -1462,16 +1467,48 @@ def pretrain(
 
     forward_events = []
     backward_events = []
-    from megatron.core.pipeline_parallel import schedules
-    schedules.forward_step = gpu_timer_wrapper(
-        schedules.forward_step,
-        forward_events
-    )
+    if args.profile_layer_time:
+        from megatron.training.layer_time_solver import prepare_layer_time_profiling_for_training
 
-    schedules.backward_step = gpu_timer_wrapper(
-        schedules.backward_step,
-        backward_events
-    )
+        model_name = os.environ.get("MODEL", "unknown_model")
+        pp_timing_dir = os.path.join("pp_timing", model_name)
+        layer_time_output_path = (
+            args.profile_layer_time_output
+            or os.path.join(pp_timing_dir, "layer_times.json")
+        )
+
+        octopipe_partition = None
+        if args.octopipe:
+            octopipe_config = get_octopipe_config()
+            octopipe_partition = octopipe_config['partition']
+
+        (
+            _stored_equation_sets,
+            _partition,
+            _stage_num,
+            _layout_mode,
+            layer_time_status,
+        ) = prepare_layer_time_profiling_for_training(
+            hybrid_layer_pattern=args.hybrid_layer_pattern,
+            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+            output_path=layer_time_output_path,
+            reset_profiled_layer_time=args.reset_profiled_layer_time,
+            decoder_first_pipeline_num_layers=args.decoder_first_pipeline_num_layers,
+            decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+            octopipe_partition=octopipe_partition,
+        )
+        print_rank_0(layer_time_status)
+
+        from megatron.core.pipeline_parallel import schedules
+        schedules.forward_step = gpu_timer_wrapper(
+            schedules.forward_step,
+            forward_events
+        )
+
+        schedules.backward_step = gpu_timer_wrapper(
+            schedules.backward_step,
+            backward_events
+        )
 
     # Initialize RL profiler if enabled
     if args.rl_profile:
@@ -1542,12 +1579,50 @@ def pretrain(
 
         iteration = args.iteration
 
-    dump_pp_timing_to_json(
-        forward_events,
-        backward_events,
-        mpu.get_pipeline_model_parallel_rank(),
-    )
-    
+    if args.profile_layer_time:
+        dump_pp_timing_to_json(
+            forward_events,
+            backward_events,
+            mpu.get_pipeline_model_parallel_rank(),
+        )
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            from megatron.training.layer_time_solver import (
+                derive_stage_layout,
+                solve_and_dump_layer_times,
+            )
+
+            model_name = os.environ.get("MODEL", "unknown_model")
+            pp_timing_dir = os.path.join("pp_timing", model_name)
+            output_path = (
+                args.profile_layer_time_output
+                or os.path.join(pp_timing_dir, "layer_times.json")
+            )
+            octopipe_partition = None
+            if args.octopipe:
+                octopipe_partition = get_octopipe_config()['partition']
+            partition, stage_num, layout_mode = derive_stage_layout(
+                hybrid_layer_pattern=args.hybrid_layer_pattern,
+                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                decoder_first_pipeline_num_layers=args.decoder_first_pipeline_num_layers,
+                decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+                octopipe_partition=octopipe_partition,
+            )
+            json_path = solve_and_dump_layer_times(
+                partition=partition,
+                hybrid_layer_pattern=args.hybrid_layer_pattern,
+                stage_num=stage_num,
+                pp_timing_dir=pp_timing_dir,
+                output_path=output_path,
+                model_name=model_name,
+                layout_mode=layout_mode,
+                reset_profiled_layer_time=args.reset_profiled_layer_time,
+            )
+            print_rank_0(
+                f'Layer time profiling: updated layer times at {json_path}'
+            )
+        torch.distributed.barrier()
+
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
         if args.perform_rl_step:

@@ -1,8 +1,15 @@
 import os
 import ast
 import math
-from typing import List, Union, Dict
+import re
+from typing import List, Union, Dict, Tuple
 from collections import defaultdict, deque
+
+import yaml
+
+_SCHEDULING_TUPLE_RE = re.compile(
+    r'^\(\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$'
+)
 
 def is_send(op):
     return op["op"] == "send"
@@ -508,6 +515,86 @@ def read_scheduling_from_file(file_path: str) -> List[Dict]:
 
     return scheduling
 
+
+def _scheduling_entry_to_dict(entry) -> Dict:
+    """Parse one scheduling entry from YAML or result.txt-derived structures."""
+    if isinstance(entry, dict):
+        if {"type", "mid", "sid", "start_time", "end_time"}.issubset(entry.keys()):
+            return {
+                "op": entry.get("op", "comp"),
+                "type": str(entry["type"]),
+                "mid": int(entry["mid"]),
+                "sid": int(entry["sid"]),
+                "did": int(entry.get("did", 0)),
+                "start_time": float(entry["start_time"]),
+                "end_time": float(entry["end_time"]),
+            }
+        raise ValueError(f"Invalid scheduling dict entry: {entry!r}")
+
+    if isinstance(entry, (list, tuple)):
+        if len(entry) != 6:
+            raise ValueError(
+                f"Scheduling entry must have 6 fields "
+                f"(type, mid, sid, did, start, end); got {entry!r}"
+            )
+        wtype, mid, sid, did, start, end = entry
+    elif isinstance(entry, str):
+        match = _SCHEDULING_TUPLE_RE.match(entry.strip())
+        if match is None:
+            raise ValueError(f"Invalid scheduling entry string: {entry!r}")
+        wtype, mid, sid, did, start, end = match.groups()
+        mid, sid, did, start, end = map(int, (mid, sid, did, start, end))
+    else:
+        raise ValueError(f"Unsupported scheduling entry type: {type(entry)!r}")
+
+    return {
+        "op": "comp",
+        "type": str(wtype),
+        "mid": int(mid),
+        "sid": int(sid),
+        "did": int(did),
+        "start_time": float(start),
+        "end_time": float(end),
+    }
+
+
+def read_octopipe_yaml(yaml_path: str) -> Tuple[List[int], List[List[int]], List[Dict]]:
+    """Load partition, placement, and scheduling from an OctoPipe YAML config."""
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(f"OctoPipe YAML config must be a mapping: {yaml_path}")
+
+    partition = data.get("partition")
+    placement = data.get("placement")
+    scheduling_raw = data.get("scheduling")
+
+    if partition is None:
+        raise ValueError(f"OctoPipe YAML config missing 'partition': {yaml_path}")
+    if placement is None:
+        raise ValueError(f"OctoPipe YAML config missing 'placement': {yaml_path}")
+    if scheduling_raw is None:
+        raise ValueError(f"OctoPipe YAML config missing 'scheduling': {yaml_path}")
+
+    if not isinstance(partition, list):
+        raise ValueError(f"'partition' must be a list in {yaml_path}")
+    if not isinstance(placement, list):
+        raise ValueError(f"'placement' must be a 2D list in {yaml_path}")
+    if not isinstance(scheduling_raw, list):
+        raise ValueError(f"'scheduling' must be a list in {yaml_path}")
+
+    partition = [int(x) for x in partition]
+    normalized_placement: List[List[int]] = []
+    for device_id, device_stages in enumerate(placement):
+        if not isinstance(device_stages, list):
+            raise ValueError(f"placement[{device_id}] must be a list in {yaml_path}")
+        normalized_placement.append([int(s) for s in device_stages])
+
+    scheduling = [_scheduling_entry_to_dict(entry) for entry in scheduling_raw]
+    return partition, normalized_placement, scheduling
+
+
 def build_stage_device_mappings(
     partition: List[int],
     placement: List[List[int]],
@@ -857,23 +944,27 @@ def overlap_aware_comm_insert(
 def reorder_cross_comm_pairs(res):
     pass
 
-def get_octopipe_config(partition_path, placement_path, results_path):
-    partition = read_partition_from_file(partition_path)
-    placement = read_placement_from_file(placement_path)
-    scheduling = read_scheduling_from_file(results_path)
-    layer_idx_offset = [sum(partition[0:i]) for i in range(len(partition)+1)]  # Assuming layer index offset is based on the first stage
+def build_octopipe_config(
+    partition: List[int],
+    placement: List[List[int]],
+    scheduling: List[Dict],
+) -> Dict:
+    """Build the runtime OctoPipe config dict from parsed partition/placement/scheduling."""
+    layer_idx_offset = [sum(partition[0:i]) for i in range(len(partition) + 1)]
 
-    assert len(partition) == sum([len(stages) for stages in placement]), "Total number of stages in placement must match length of partition"
-    assert set().union(*placement) == set(range(len(partition))), "All stages must be placed exactly once in placement"
+    assert len(partition) == sum(len(stages) for stages in placement), (
+        "Total number of stages in placement must match length of partition"
+    )
+    assert set().union(*placement) == set(range(len(partition))), (
+        "All stages must be placed exactly once in placement"
+    )
 
     stage_device_mapping, device_stage_mapping = build_stage_device_mappings(
         partition,
         placement,
     )
 
-    stage_chunk_mapping = build_stage_chunk_mappings(
-        device_stage_mapping
-    )
+    stage_chunk_mapping = build_stage_chunk_mappings(device_stage_mapping)
 
     workload_exe_order = build_workload_exe_order(
         stage_device_mapping,
@@ -883,18 +974,20 @@ def get_octopipe_config(partition_path, placement_path, results_path):
     # NVSHMEM-Based P2P Comm order
     # workload_comp_comm_order = insert_comm_ops(workload_exe_order, stage_device_mapping)
     # NCCL-Based P2P Comm order
-    workload_comp_comm_order = overlap_aware_comm_insert(workload_exe_order, stage_device_mapping)
-    
+    workload_comp_comm_order = overlap_aware_comm_insert(
+        workload_exe_order, stage_device_mapping
+    )
+
     layout = generate_pipeline_layout(partition=partition, placement=placement)
 
     stage_num = len(partition)
-    max_chunk_num = max([len(sids) for sids in device_stage_mapping.values()])
+    max_chunk_num = max(len(sids) for sids in device_stage_mapping.values())
     padded_device_stage_mapping = {
         key: value + [-1] * (max_chunk_num - len(value))
         for key, value in device_stage_mapping.items()
     }
 
-    res = {
+    return {
         "sid->did": stage_device_mapping,
         "did->sid": device_stage_mapping,
         "sid->cid": stage_chunk_mapping,
@@ -908,7 +1001,17 @@ def get_octopipe_config(partition_path, placement_path, results_path):
         "partition": partition,
     }
 
-    return res
+
+def get_octopipe_config(partition_path, placement_path, results_path):
+    partition = read_partition_from_file(partition_path)
+    placement = read_placement_from_file(placement_path)
+    scheduling = read_scheduling_from_file(results_path)
+    return build_octopipe_config(partition, placement, scheduling)
+
+
+def get_octopipe_config_from_yaml(yaml_path: str) -> Dict:
+    partition, placement, scheduling = read_octopipe_yaml(yaml_path)
+    return build_octopipe_config(partition, placement, scheduling)
 
 def print_ops(workload_comp_comm_order, skip_comp=True, s_sid:list=[], r_sid:list=[], num:int=20, s:int=0):
     # 首先找到最长的输出字符串

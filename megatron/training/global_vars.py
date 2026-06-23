@@ -362,15 +362,50 @@ def get_octopipe_config():
         return None
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+
+    from octopipe.generate_inst import (
+        get_octopipe_config as goc,
+        get_octopipe_config_from_yaml,
+    )
+
+    yaml_path = getattr(args, 'octopipe_config_yaml', None)
+    if yaml_path:
+        resolved_yaml = _resolve_octopipe_config_path(yaml_path, project_root)
+        return get_octopipe_config_from_yaml(resolved_yaml)
+
+    if not args.octopipe_config_dir:
+        raise ValueError(
+            '--octopipe requires --octopipe-config-yaml or --octopipe-config-dir.'
+        )
+
     octopipe_config_dir = os.path.join(project_root, "octopipe", args.octopipe_config_dir)
     partition_path = os.path.join(octopipe_config_dir, "partition.txt")
     placement_path = os.path.join(octopipe_config_dir, "placement.txt")
     results_path = os.path.join(octopipe_config_dir, "result.txt")
 
-    from octopipe.generate_inst import get_octopipe_config as goc
-    octopipe_config = goc(
+    return goc(
         partition_path=partition_path,
         placement_path=placement_path,
         results_path=results_path,
     )
-    return octopipe_config
+
+
+def _resolve_octopipe_config_path(config_path: str, project_root: str) -> str:
+    """Resolve an OctoPipe YAML path from absolute or repo-relative locations."""
+    if os.path.isabs(config_path) and os.path.isfile(config_path):
+        return config_path
+
+    workspace_root = os.path.dirname(project_root)
+    candidates = [
+        os.path.abspath(config_path),
+        os.path.join(project_root, config_path),
+        os.path.join(workspace_root, config_path),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        f"OctoPipe YAML config not found: {config_path}. "
+        f"Tried: {', '.join(candidates)}"
+    )
