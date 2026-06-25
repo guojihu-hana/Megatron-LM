@@ -1,6 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import os
+import sys
+import time
+from importlib import import_module
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -9,6 +13,8 @@ import torch.distributed as dist
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
+
+logger = logging.getLogger(__name__)
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -929,6 +935,34 @@ class P2PCommunicator:
         return input_tensor, output_tensor_grad
 
 
+def _ensure_local_nvshmem_compat():
+    """Patch cuda-core module paths expected by some nvshmem4py builds.
+
+    Keep this local to the OctoPipe communicator so it does not depend on the
+    resharding NVSHMEM implementation or inherit future changes there.
+    """
+    for submod in ("_memory", "_stream"):
+        exp_key = f"cuda.core.experimental.{submod}"
+        new_key = f"cuda.core.{submod}"
+        if exp_key not in sys.modules:
+            try:
+                sys.modules[exp_key] = import_module(new_key)
+            except ImportError:
+                pass
+
+
+def _get_cuda_core_device_class():
+    """Return cuda-core Device from the available cuda-core layout."""
+    try:
+        from cuda.core import Device
+
+        return Device
+    except ImportError:
+        from cuda.core.experimental import Device
+
+        return Device
+
+
 class NvshmemP2PCommunicator:
     """NVSHMEM symmetric-memory P2P for pipeline stages (1F1B and OctoPipe).
 
@@ -939,7 +973,25 @@ class NvshmemP2PCommunicator:
     Enabled via ``MEGATRON_NVSHMEM_P2P=1``; default NCCL path is unchanged when unset.
     """
 
+    _instances = {}
+
+    def __new__(cls, pp_group, config: object):
+        # The OctoPipe schedule can construct a communicator every train
+        # iteration when the caller does not pass one in.  NVSHMEM init and
+        # symmetric allocations are process-lifetime resources; doing them
+        # repeatedly leaks/fragment heaps and dominates iteration time.
+        key = (id(pp_group), torch.cuda.current_device())
+        instance = cls._instances.get(key)
+        if instance is None:
+            instance = super().__new__(cls)
+            instance._nvshmem_initialized = False
+            cls._instances[key] = instance
+        return instance
+
     def __init__(self, pp_group, config: object):
+        if getattr(self, "_nvshmem_initialized", False):
+            self.config = config
+            return
         self.pp_group = pp_group
         self.config = config
         self._rank = pp_group.rank()
@@ -957,6 +1009,28 @@ class NvshmemP2PCommunicator:
         self._shape_initialized = set()
         self._stream = None
         self._nv = None
+        self._slot_bytes = int(os.environ.get("MEGATRON_NVSHMEM_P2P_BUFFER_BYTES", "0"))
+        self._buffer_factor = int(os.environ.get("MEGATRON_NVSHMEM_P2P_BUFFER_FACTOR", "1"))
+        self._pool_initialized = False
+        self._data_slots = None
+        self._send_buffer = None
+        self._ready_flags = None
+        self._meta = None
+        self._meta_src_pe = None
+        self._meta_sender_sid = None
+        self._meta_recver_sid = None
+        self._meta_mid = None
+        self._meta_seq = None
+        self._meta_num_bytes = None
+        self._tmp_ready = None
+        self._tmp_meta = None
+        self._tmp_meta_src_pe = None
+        self._tmp_meta_sender_sid = None
+        self._tmp_meta_recver_sid = None
+        self._tmp_meta_mid = None
+        self._tmp_meta_seq = None
+        self._tmp_meta_num_bytes = None
+        self._slot_release_seq = {}
         # Per-shape ready sequence ids (pure NVSHMEM handshake, no NCCL send/recv).
         self._send_fwd_seq = {}
         self._send_bwd_seq = {}
@@ -972,19 +1046,41 @@ class NvshmemP2PCommunicator:
             os.environ.get("MEGATRON_NVSHMEM_PENDING_MAX", "256")
         )
         self._pending_overflow_warned = False
-        # Ring buffer slots per peer channel to avoid payload overwrite.
-        self._peer_slots = int(os.environ.get("MEGATRON_NVSHMEM_PEER_SLOTS", "8"))
-        assert self._peer_slots >= 2, "MEGATRON_NVSHMEM_PEER_SLOTS must be >= 2"
-        self._trace_max = int(os.environ.get("MEGATRON_NVSHMEM_TRACE_MAX", "0"))
+        self._route_slots = {}
+        self._route_slot_counts = {}
+        self._registered_workloads_id = None
+        # Fixed-size NVSHMEM staging slots for routed OctoPipe peer traffic.
+        self._peer_slots = int(os.environ.get("MEGATRON_NVSHMEM_P2P_NUM_SLOTS", "8"))
+        assert self._peer_slots >= 2, "MEGATRON_NVSHMEM_P2P_NUM_SLOTS must be >= 2"
+        self._trace_max = int(os.environ.get("MEGATRON_NVSHMEM_TRACE_MAX", "-1"))
         self._trace_count = 0
-        self._warned_remote_ready_fallback = False
+        self._total_slots = self._world * self._peer_slots
+        self._cuda_wait_until = None
+        self._nv_bindings = None
+        self._nv_cmp_eq = None
+        self._nv_cmp_ge = None
         self._init_nvshmem()
+        self._nvshmem_initialized = True
 
     def _init_nvshmem(self):
+        _ensure_local_nvshmem_compat()
         import nvshmem.core as nvshmem_core
-        from cuda.core.experimental import Device
+        from nvshmem.bindings import nvshmem as nvshmem_bindings
 
-        os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
+        Device = _get_cuda_core_device_class()
+
+        # Keep the single-node smoke-test workaround opt-in.  For production
+        # multi-node runs, forcing NVSHMEM_REMOTE_TRANSPORT=none disables the
+        # remote transport path and can prevent inter-node NVSHMEM P2P.
+        if os.environ.get("MEGATRON_NVSHMEM_SINGLE_NODE", "0") == "1":
+            os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
+
+        max_ctas = os.environ.get("NVSHMEM_MAX_CTAS")
+        if max_ctas != "2":
+            logger.warning(
+                "Recommended NVSHMEM_MAX_CTAS=2 for this path. Current value is %r.", max_ctas
+            )
+
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         dev = Device(local_rank)
         dev.set_current()
@@ -1001,7 +1097,250 @@ class NvshmemP2PCommunicator:
             initializer_method="uid",
         )
         self._nv = nvshmem_core
+        self._nv_bindings = nvshmem_bindings
+        self._nv_cmp_eq = nvshmem_bindings.Cmp_type.CMP_EQ
+        self._nv_cmp_ge = nvshmem_bindings.Cmp_type.CMP_GE
+        self._init_p2p_pool()
         torch.distributed.barrier(group=self.pp_group)
+
+    def _init_p2p_pool(self):
+        """Allocate fixed-size symmetric staging buffers for OctoPipe peer traffic."""
+        if self._pool_initialized:
+            return
+        if self._slot_bytes <= 0:
+            inferred_bytes = self._infer_p2p_slot_bytes_from_config()
+            # Lazily allocating symmetric memory after traffic starts is unsafe because
+            # NVSHMEM allocations must happen in identical order on all PEs.  Infer
+            # factor*b*s*h when config carries those fields; otherwise use an explicit
+            # conservative default and let users override it for 4*b*s*h / 8*b*s*h runs.
+            self._slot_bytes = int(
+                os.environ.get(
+                    "MEGATRON_NVSHMEM_P2P_DEFAULT_BUFFER_BYTES",
+                    str(inferred_bytes if inferred_bytes is not None else 256 * 1024 * 1024),
+                )
+            )
+        if self._slot_bytes <= 0:
+            raise RuntimeError("MEGATRON_NVSHMEM_P2P_BUFFER_BYTES must be positive")
+
+        torch.distributed.barrier(group=self.pp_group)
+        self._data_slots = [self._nv.tensor((self._slot_bytes,), dtype=torch.uint8) for _ in range(self._total_slots)]
+        self._send_buffer = self._nv.tensor((self._slot_bytes,), dtype=torch.uint8)
+        self._ready_flags = [self._nv.tensor((1,), dtype=torch.int64) for _ in range(self._total_slots)]
+        self._meta = [self._nv.tensor((6,), dtype=torch.int64) for _ in range(self._total_slots)]
+        # Backward-compatible aliases for helper code and targeted debugging.
+        self._meta_src_pe = [m[0:1] for m in self._meta]
+        self._meta_sender_sid = [m[1:2] for m in self._meta]
+        self._meta_recver_sid = [m[2:3] for m in self._meta]
+        self._meta_mid = [m[3:4] for m in self._meta]
+        self._meta_seq = [m[4:5] for m in self._meta]
+        self._meta_num_bytes = [m[5:6] for m in self._meta]
+        self._tmp_ready = self._nv.tensor((1,), dtype=torch.int64)
+        self._tmp_meta = self._nv.tensor((6,), dtype=torch.int64)
+        self._tmp_meta_src_pe = self._tmp_meta[0:1]
+        self._tmp_meta_sender_sid = self._tmp_meta[1:2]
+        self._tmp_meta_recver_sid = self._tmp_meta[2:3]
+        self._tmp_meta_mid = self._tmp_meta[3:4]
+        self._tmp_meta_seq = self._tmp_meta[4:5]
+        self._tmp_meta_num_bytes = self._tmp_meta[5:6]
+        with torch.no_grad():
+            for slot in range(self._total_slots):
+                self._data_slots[slot].zero_()
+                self._ready_flags[slot].zero_()
+                self._meta[slot][0].zero_()
+                self._meta[slot][1].fill_(-1)
+                self._meta[slot][2].fill_(-1)
+                self._meta[slot][3].fill_(-1)
+                self._meta[slot][4].zero_()
+                self._meta[slot][5].zero_()
+            self._send_buffer.zero_()
+            self._tmp_ready.zero_()
+            self._tmp_meta[0].zero_()
+            self._tmp_meta[1].fill_(-1)
+            self._tmp_meta[2].fill_(-1)
+            self._tmp_meta[3].fill_(-1)
+            self._tmp_meta[4].zero_()
+            self._tmp_meta[5].zero_()
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=self.pp_group)
+        self._pool_initialized = True
+
+    def _route_requires_metadata(self, route_key) -> bool:
+        return (
+            isinstance(route_key, tuple)
+            and len(route_key) == 3
+            and all(v is not None for v in route_key)
+        )
+
+    def _validate_route_key(self, route_key):
+        if not self._route_requires_metadata(route_key):
+            raise RuntimeError(
+                "NvshmemP2PCommunicator routed send/recv requires explicit sender_sid, "
+                f"recver_sid, and mid; got route={route_key}."
+            )
+
+    def _tensor_nbytes(self, tensor: torch.Tensor) -> int:
+        return tensor.numel() * tensor.element_size()
+
+    def _shape_nbytes(self, tensor_shape: Shape) -> int:
+        shape = tuple(tensor_shape) if not isinstance(tensor_shape, torch.Size) else tuple(tensor_shape)
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        return numel * torch.empty((), dtype=self.config.pipeline_dtype).element_size()
+
+    def _slot_slice(self, slot: int, num_bytes: int):
+        if slot < 0 or slot >= self._total_slots:
+            raise RuntimeError(f"NVSHMEM P2P slot {slot} out of range [0,{self._total_slots})")
+        if num_bytes < 0 or num_bytes > self._slot_bytes:
+            raise RuntimeError(
+                f"NVSHMEM P2P message size {num_bytes} bytes exceeds configured slot size "
+                f"{self._slot_bytes} bytes. Increase MEGATRON_NVSHMEM_P2P_BUFFER_BYTES "
+                "or reduce MEGATRON_NVSHMEM_P2P_BUFFER_FACTOR-derived payload size."
+            )
+        return self._data_slots[slot][:num_bytes]
+
+    def _slot_for_route(self, route_key, seq: int, src_group_rank: int = None) -> int:
+        # Partition the recv pool by source PE so simultaneous forward/backward
+        # neighbors cannot alias the same slot on this rank.
+        src_pe = self._rank if src_group_rank is None else int(src_group_rank)
+        return src_pe * self._peer_slots + self._peer_slot(route_key, seq)
+
+    def _wait_remote_slot_empty(self, dst_group_rank: int, slot: int):
+        """Poll the destination PE's ready flag before reusing its staging slot."""
+        self._nv.get(
+            dst=self._tmp_ready,
+            src=self._ready_flags[slot],
+            remote_pe=dst_group_rank,
+            stream=self._stream,
+        )
+        self._nv.quiet(stream=self._stream)
+        self._call_nvshmem_wait_until(self._tmp_ready, 0, exact=True)
+
+    def _write_remote_slot_meta(self, slot: int, dst_group_rank: int, route_key, seq: int, num_bytes: int):
+        sender_sid, recver_sid, mid = route_key
+        with torch.no_grad():
+            self._tmp_meta[0].fill_(self._rank)
+            self._tmp_meta[1].fill_(int(sender_sid))
+            self._tmp_meta[2].fill_(int(recver_sid))
+            self._tmp_meta[3].fill_(int(mid))
+            self._tmp_meta[4].fill_(int(seq))
+            self._tmp_meta[5].fill_(int(num_bytes))
+        self._nv.put(
+            dst=self._meta[slot],
+            src=self._tmp_meta,
+            remote_pe=dst_group_rank,
+            stream=self._stream,
+        )
+
+    def _read_slot_meta(self, slot: int):
+        meta = self._meta[slot]
+        return {
+            "src_pe": int(meta[0].item()),
+            "sender_sid": int(meta[1].item()),
+            "recver_sid": int(meta[2].item()),
+            "mid": int(meta[3].item()),
+            "seq": int(meta[4].item()),
+            "num_bytes": int(meta[5].item()),
+        }
+
+    def _pending_key(self, src_group_rank: int, route_key, seq: int):
+        return (int(src_group_rank), self._rank, route_key, int(seq))
+
+    def _try_pop_pending_payload(self, out: torch.Tensor, src_group_rank: int, route_key, seq: int):
+        key = self._pending_key(src_group_rank, route_key, seq)
+        payload = self._pending_peer_payloads.pop(key, None)
+        if payload is None:
+            return False
+        if payload.numel() != self._tensor_nbytes(out):
+            raise RuntimeError(
+                f"NVSHMEM pending payload size mismatch on rank {self._rank}: "
+                f"payload={payload.numel()} expected={self._tensor_nbytes(out)} route={route_key}"
+            )
+        with torch.no_grad():
+            out.view(torch.uint8).reshape(-1).copy_(payload, non_blocking=True)
+        return True
+
+    def _stash_ready_slot(self, slot: int, meta):
+        route_key = (meta["sender_sid"], meta["recver_sid"], meta["mid"])
+        key = self._pending_key(meta["src_pe"], route_key, meta["seq"])
+        if key not in self._pending_peer_payloads:
+            if len(self._pending_peer_payloads) >= self._pending_peer_payloads_max:
+                raise RuntimeError(
+                    "NVSHMEM pending payload stash is full on rank "
+                    f"{self._rank}: max={self._pending_peer_payloads_max}. "
+                    "Increase MEGATRON_NVSHMEM_PENDING_MAX."
+                )
+            payload = torch.empty(
+                (meta["num_bytes"],), dtype=torch.uint8, device=torch.cuda.current_device()
+            )
+            with torch.no_grad():
+                payload.copy_(self._slot_slice(slot, meta["num_bytes"]), non_blocking=True)
+            self._pending_peer_payloads[key] = payload
+            self._trace_event(
+                f"stash src={meta['src_pe']} dst={self._rank} route={route_key} "
+                f"seq={meta['seq']} slot={slot}"
+            )
+        self._release_slot(slot)
+
+    def _drain_ready_slots(self, src_group_rank: int, expected_route=None, expected_seq=None):
+        """Move ready but not-yet-consumed staging slots into owned tensors.
+
+        OctoPipe can send several messages before the matching recv wait is reached.
+        Draining prevents the fixed staging pool from filling and blocking senders.
+        Returns the slot containing the expected message if it is currently ready.
+        """
+        expected_slot = None
+        start = int(src_group_rank) * self._peer_slots
+        end = start + self._peer_slots
+        for slot in range(start, end):
+            ready = int(self._ready_flags[slot][0].item())
+            if ready == 0:
+                continue
+            meta = self._read_slot_meta(slot)
+            route_key = (meta["sender_sid"], meta["recver_sid"], meta["mid"])
+            if (
+                meta["src_pe"] == int(src_group_rank)
+                and route_key == expected_route
+                and meta["seq"] == int(expected_seq)
+            ):
+                expected_slot = slot
+                continue
+            self._stash_ready_slot(slot, meta)
+        return expected_slot
+
+    def _validate_slot_meta(self, slot: int, src_group_rank: int, route_key, expected_seq: int, expected_bytes: int):
+        meta = self._read_slot_meta(slot)
+        expected = {
+            "src_pe": int(src_group_rank),
+            "sender_sid": int(route_key[0]),
+            "recver_sid": int(route_key[1]),
+            "mid": int(route_key[2]),
+            "seq": int(expected_seq),
+            "num_bytes": int(expected_bytes),
+        }
+        mismatches = {k: (meta[k], v) for k, v in expected.items() if meta[k] != v}
+        if mismatches:
+            raise RuntimeError(
+                f"NVSHMEM P2P slot metadata mismatch on rank {self._rank}, slot {slot}, "
+                f"route={route_key}: {mismatches}"
+            )
+
+    def _release_slot(self, slot: int):
+        with torch.no_grad():
+            self._ready_flags[slot].zero_()
+            self._meta[slot][5].zero_()
+            self._meta[slot][1].fill_(-1)
+            self._meta[slot][2].fill_(-1)
+            self._meta[slot][3].fill_(-1)
+
+    def _infer_p2p_slot_bytes_from_config(self):
+        micro_batch_size = getattr(self.config, "micro_batch_size", None)
+        seq_length = getattr(self.config, "seq_length", None)
+        hidden_size = getattr(self.config, "hidden_size", None)
+        if micro_batch_size is None or seq_length is None or hidden_size is None:
+            return None
+        dtype_size = torch.empty((), dtype=self.config.pipeline_dtype).element_size()
+        return int(self._buffer_factor) * int(micro_batch_size) * int(seq_length) * int(hidden_size) * dtype_size
 
     def _shape_key(self, tensor_shape: Shape):
         shape = tuple(tensor_shape) if isinstance(tensor_shape, (list, tuple, torch.Size)) else (tensor_shape,)
@@ -1051,36 +1390,30 @@ class NvshmemP2PCommunicator:
                 else:
                     self._mailboxes[mkey] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
 
-        # Allocate point-to-point channels for arbitrary PP-rank communication.
-        for src in range(self._world):
-            for slot in range(self._peer_slots):
-                for channel in (
-                    f"peer_data_from_{src}_slot_{slot}",
-                    f"peer_ready_from_{src}_slot_{slot}",
-                ):
-                    mkey = (channel, shape, str(self.config.pipeline_dtype))
-                    if mkey not in self._mailboxes:
-                        if "ready" in channel:
-                            t = self._nv.tensor((1,), dtype=torch.int64)
-                            t.zero_()
-                            self._mailboxes[mkey] = t
-                        else:
-                            self._mailboxes[mkey] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
-        for channel in ("peer_tmp_data", "peer_tmp_ready"):
-            mkey = (channel, shape, str(self.config.pipeline_dtype))
-            if mkey not in self._mailboxes:
-                if "ready" in channel:
-                    t = self._nv.tensor((1,), dtype=torch.int64)
-                    t.zero_()
-                    self._mailboxes[mkey] = t
-                else:
-                    self._mailboxes[mkey] = self._nv.tensor(shape, dtype=self.config.pipeline_dtype)
+        # The fixed-size staging pool below is the only peer data path.  Avoid
+        # allocating the older per-shape peer mailboxes here: they are unused by
+        # routed OctoPipe traffic, waste symmetric heap memory, and make NVSHMEM
+        # heap exhaustion more likely for large activations.
         torch.distributed.barrier(group=self.pp_group)
         self._shape_initialized.add(key)
 
     def register_workload_routes(self, workloads):
-        # No-op: keep API compatibility with schedules.py.
-        del workloads
+        workloads_id = id(workloads)
+        if self._registered_workloads_id == workloads_id:
+            return
+        route_counts = {}
+        for workload in workloads:
+            if workload.get("op") not in ("send", "recv"):
+                continue
+            route_key = self._msg_route_key(
+                sender_sid=workload.get("sender_sid"),
+                recver_sid=workload.get("recver_sid"),
+                mid=workload.get("mid"),
+            )
+            route_counts[route_key] = route_counts.get(route_key, 0) + 1
+        self._route_slot_counts = route_counts
+        self._route_slots = {}
+        self._registered_workloads_id = workloads_id
 
     def _get_mailbox(self, tensor_shape: Shape, channel: str):
         self._ensure_mailboxes_for_shape(tensor_shape)
@@ -1105,7 +1438,6 @@ class NvshmemP2PCommunicator:
             send_src.copy_(tensor_send_next)
             dst = self._get_mailbox(tensor_send_next.shape, "fwd")
             self._nv.put(dst=dst, src=send_src, remote_pe=self._next_pe, stream=self._stream)
-            self._nv.quiet(stream=self._stream)
             # NVSHMEM-only ready handshake: write sequence id to receiver's ready flag.
             seq = self._send_fwd_seq.get(shape_key, 0) + 1
             self._send_fwd_seq[shape_key] = seq
@@ -1113,14 +1445,12 @@ class NvshmemP2PCommunicator:
             ready_src.fill_(seq)
             ready_dst = self._get_mailbox(tensor_send_next.shape, "fwd_ready")
             self._nv.put(dst=ready_dst, src=ready_src, remote_pe=self._next_pe, stream=self._stream)
-            self._nv.quiet(stream=self._stream)
         if tensor_send_prev is not None:
             assert self._prev_pe is not None
             send_src = self._get_mailbox(tensor_send_prev.shape, "tmp_send_bwd")
             send_src.copy_(tensor_send_prev)
             dst = self._get_mailbox(tensor_send_prev.shape, "bwd")
             self._nv.put(dst=dst, src=send_src, remote_pe=self._prev_pe, stream=self._stream)
-            self._nv.quiet(stream=self._stream)
             # NVSHMEM-only ready handshake: write sequence id to receiver's ready flag.
             seq = self._send_bwd_seq.get(shape_key, 0) + 1
             self._send_bwd_seq[shape_key] = seq
@@ -1128,25 +1458,20 @@ class NvshmemP2PCommunicator:
             ready_src.fill_(seq)
             ready_dst = self._get_mailbox(tensor_send_prev.shape, "bwd_ready")
             self._nv.put(dst=ready_dst, src=ready_src, remote_pe=self._prev_pe, stream=self._stream)
-            self._nv.quiet(stream=self._stream)
 
         tensor_recv_prev = None
         tensor_recv_next = None
         if recv_prev:
             expected = self._recv_fwd_seq.get(shape_key, 0) + 1
             ready_local = self._get_mailbox(tensor_shape, "fwd_ready")
-            # Busy-wait on local symmetric flag; peer updates it with nvshmem.put.
-            while int(ready_local.item()) < expected:
-                pass
+            self._call_nvshmem_wait_until(ready_local, expected)
             self._recv_fwd_seq[shape_key] = expected
             local = self._get_mailbox(tensor_shape, "fwd")
             tensor_recv_prev = local.clone().requires_grad_(True)
         if recv_next:
             expected = self._recv_bwd_seq.get(shape_key, 0) + 1
             ready_local = self._get_mailbox(tensor_shape, "bwd_ready")
-            # Busy-wait on local symmetric flag; peer updates it with nvshmem.put.
-            while int(ready_local.item()) < expected:
-                pass
+            self._call_nvshmem_wait_until(ready_local, expected)
             self._recv_bwd_seq[shape_key] = expected
             local = self._get_mailbox(tensor_shape, "bwd")
             tensor_recv_next = local.clone().requires_grad_(True)
@@ -1157,7 +1482,7 @@ class NvshmemP2PCommunicator:
             return None
 
     class _NvshmemPeerRecvHandle:
-        """Deferred NVSHMEM peer recv — matches NCCL ``irecv`` + ``wait()`` semantics for OctoPipe."""
+        """Deferred NVSHMEM peer recv using the fixed OctoPipe staging pool."""
 
         __slots__ = ("_comm", "_out", "_shape", "_src_pe", "_done", "_route_key")
 
@@ -1278,25 +1603,79 @@ class NvshmemP2PCommunicator:
         ) & 0xFFFFFFFF
         return mixed % self._peer_slots
 
-    def _peek_remote_ready(self, tensor_shape: Shape, src_group_rank: int, slot: int, remote_pe: int) -> int:
-        """Read remote PE's ready flag for src+slot. Returns int64 tag (0 means empty)."""
-        ch_ready = f"peer_ready_from_{src_group_rank}_slot_{slot}"
-        remote_ready = self._get_mailbox(tensor_shape, ch_ready)
-        tmp_ready = self._get_mailbox(tensor_shape, "peer_tmp_ready")
-        try:
-            # Preferred: probe receiver-side occupancy via remote GET.
-            self._nv.get(dst=tmp_ready, src=remote_ready, remote_pe=remote_pe, stream=self._stream)
-            self._nv.quiet(stream=self._stream)
-            return int(tmp_ready.item())
-        except Exception:
-            # Fallback when Python binding lacks get(): preserves previous behavior.
-            if not self._warned_remote_ready_fallback:
-                self._warned_remote_ready_fallback = True
-                self._trace_event(
-                    "warn remote-ready-probe-fallback=local-item "
-                    "(nvshmem.get unavailable in current python binding)"
-                )
-            return int(remote_ready.item())
+    def _get_cuda_wait_until(self):
+        if self._cuda_wait_until is not None:
+            return self._cuda_wait_until
+        from torch.utils.cpp_extension import load_inline
+
+        cpp_source = r'''
+#include <torch/extension.h>
+
+void wait_until(torch::Tensor flag, int64_t expected, bool exact);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("wait_until", &wait_until, "Wait until a CUDA scalar reaches expected");
+}
+'''
+        cuda_source = r'''
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cstdint>
+
+__global__ void wait_until_i32_kernel(const int* flag, int64_t expected, bool exact) {
+    const volatile int* volatile_flag = flag;
+    while (true) {
+        int64_t value = (int64_t)(*volatile_flag);
+        if ((exact && value == expected) || (!exact && value >= expected)) {
+            break;
+        }
+        __nanosleep(64);
+    }
+}
+
+__global__ void wait_until_i64_kernel(const int64_t* flag, int64_t expected, bool exact) {
+    const volatile int64_t* volatile_flag = flag;
+    while (true) {
+        int64_t value = *volatile_flag;
+        if ((exact && value == expected) || (!exact && value >= expected)) {
+            break;
+        }
+        __nanosleep(64);
+    }
+}
+
+void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
+    TORCH_CHECK(flag.is_cuda(), "wait flag must be a CUDA tensor");
+    TORCH_CHECK(flag.numel() == 1, "wait flag must be scalar");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (flag.scalar_type() == at::kInt) {
+        wait_until_i32_kernel<<<1, 1, 0, stream>>>(flag.data_ptr<int>(), expected, exact);
+    } else if (flag.scalar_type() == at::kLong) {
+        wait_until_i64_kernel<<<1, 1, 0, stream>>>(flag.data_ptr<int64_t>(), expected, exact);
+    } else {
+        TORCH_CHECK(false, "wait flag must be int32 or int64");
+    }
+}
+'''
+        module = load_inline(
+            name="megatron_nvshmem_wait_until_ge",
+            cpp_sources=cpp_source,
+            cuda_sources=cuda_source,
+            functions=None,
+            with_cuda=True,
+            verbose=False,
+        )
+        self._cuda_wait_until = module.wait_until
+        return self._cuda_wait_until
+
+    def _call_nvshmem_wait_until(self, ready, expected: int, exact: bool = False):
+        signal_wait = getattr(self._nv_bindings, "signal_wait_until_on_stream", None)
+        cmp_op = self._nv_cmp_eq if exact else self._nv_cmp_ge
+        if signal_wait is not None and cmp_op is not None:
+            stream = int(self._stream.__cuda_stream__()[1])
+            signal_wait(ready.data_ptr(), int(cmp_op), int(expected), stream)
+            return
+        self._get_cuda_wait_until()(ready, int(expected), exact)
 
     def _resolve_peer_group_rank(self, rank_maybe_global: int) -> int:
         # Prefer interpreting input as global rank if it belongs to this pp_group.
@@ -1312,161 +1691,109 @@ class NvshmemP2PCommunicator:
         )
 
     def _send_peer_tensor(self, t: torch.Tensor, dst_group_rank: int, route_key=None):
+        """Stage a tensor into a bounded NVSHMEM slot and mark it ready with explicit metadata."""
         if dst_group_rank == self._rank:
             raise RuntimeError("NVSHMEM peer send does not support self-send")
-        shape_key = self._shape_key(t.shape)
-        self._ensure_mailboxes_for_shape(t.shape)
+        self._validate_route_key(route_key)
+        if not t.is_contiguous():
+            t = t.contiguous()
+        num_bytes = self._tensor_nbytes(t)
+        if num_bytes > self._slot_bytes:
+            raise RuntimeError(
+                f"NVSHMEM P2P route={route_key} tensor size {num_bytes} bytes exceeds slot size "
+                f"{self._slot_bytes} bytes. Configure MEGATRON_NVSHMEM_P2P_BUFFER_BYTES for this run."
+            )
 
-        ch_data_tmp = "peer_tmp_data"
-        ch_ready_tmp = "peer_tmp_ready"
-
-        tmp_data = self._get_mailbox(t.shape, ch_data_tmp)
-        tmp_data.copy_(t)
-        seq_key = (self._rank, dst_group_rank, shape_key, route_key)
+        seq_key = (self._rank, dst_group_rank, route_key)
         seq = self._send_peer_seq.get(seq_key, 0) + 1
-        preferred_slot = self._peer_slot(route_key, seq)
-        slot = None
-        dst_ready = None
-        spin = 0
-        max_spin = int(os.environ.get("MEGATRON_NVSHMEM_SEND_WAIT_MAX_SPIN", "0"))
-        while slot is None:
-            # Probe for any free slot to avoid head-of-line blocking.
-            for offset in range(self._peer_slots):
-                cand_slot = (preferred_slot + offset) % self._peer_slots
-                seen_tag = self._peek_remote_ready(
-                    t.shape, src_group_rank=self._rank, slot=cand_slot, remote_pe=dst_group_rank
-                )
-                if seen_tag == 0:
-                    slot = cand_slot
-                    ch_ready_cand = f"peer_ready_from_{self._rank}_slot_{cand_slot}"
-                    dst_ready = self._get_mailbox(t.shape, ch_ready_cand)
-                    break
-            if max_spin > 0:
-                spin += 1
-            if max_spin > 0 and spin >= max_spin:
-                raise RuntimeError(
-                    "NVSHMEM peer send wait timeout: no free slot on receiver. "
-                    f"src_pe={self._rank} dst_pe={dst_group_rank} preferred_slot={preferred_slot} "
-                    f"route_key={route_key} seq={seq}"
-                )
-        ch_data_dst = f"peer_data_from_{self._rank}_slot_{slot}"
-        ch_ready_dst = f"peer_ready_from_{self._rank}_slot_{slot}"
+        slot = self._slot_for_route(route_key, seq, src_group_rank=self._rank)
         self._trace_event(
-            f"send src={self._rank} dst={dst_group_rank} route={route_key} seq={seq} slot={slot} pref={preferred_slot}"
+            f"send src={self._rank} dst={dst_group_rank} route={route_key} seq={seq} slot={slot} bytes={num_bytes}"
         )
         self._send_peer_seq[seq_key] = seq
 
-        dst_data = self._get_mailbox(t.shape, ch_data_dst)
-        self._nv.put(dst=dst_data, src=tmp_data, remote_pe=dst_group_rank, stream=self._stream)
-        self._nv.quiet(stream=self._stream)
-        tmp_ready = self._get_mailbox(t.shape, ch_ready_tmp)
-        tmp_ready.fill_(self._ready_tag(route_key, seq))
-        self._nv.put(dst=dst_ready, src=tmp_ready, remote_pe=dst_group_rank, stream=self._stream)
+        # Do not overwrite a remote staging slot until the receiver has copied
+        # the previous payload out and cleared the ready flag.
+        self._wait_remote_slot_empty(dst_group_rank, slot)
+
+        send_src = self._send_buffer[:num_bytes]
+        send_src.copy_(t.view(torch.uint8).reshape(-1))
+        dst_data = self._slot_slice(slot, num_bytes)
+        self._nv.put(dst=dst_data, src=send_src, remote_pe=dst_group_rank, stream=self._stream)
+        self._write_remote_slot_meta(slot, dst_group_rank, route_key, seq, num_bytes)
+        with torch.no_grad():
+            self._tmp_ready.fill_(self._ready_tag(route_key, seq))
+        self._nv.put(
+            dst=self._ready_flags[slot],
+            src=self._tmp_ready,
+            remote_pe=dst_group_rank,
+            stream=self._stream,
+        )
+        # Ensure payload, metadata, and ready flag are ordered before the caller
+        # can enqueue dependent sends that may reuse the single local send buffer.
         self._nv.quiet(stream=self._stream)
 
     def _recv_peer_tensor_into(
         self, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int, route_key=None
     ):
-        """Block until peer data is ready, then copy symmetric mailbox into ``out``."""
+        """Wait for routed metadata, copy from staging into ``out``, then release the slot."""
         if src_group_rank == self._rank:
             raise RuntimeError("NVSHMEM peer recv does not support self-recv")
-        shape_key = self._shape_key(tensor_shape)
-        self._ensure_mailboxes_for_shape(tensor_shape)
-
-        expected_key = (src_group_rank, self._rank, shape_key, route_key)
+        self._validate_route_key(route_key)
+        expected_key = (src_group_rank, self._rank, route_key)
         expected = self._recv_peer_seq.get(expected_key, 0) + 1
         expected_tag = self._ready_tag(route_key, expected)
-        pending_key = (src_group_rank, self._rank, shape_key, route_key, expected)
-        pending = self._pending_peer_payloads.pop(pending_key, None)
-        if pending is not None:
-            with torch.no_grad():
-                out.copy_(pending)
+        if self._try_pop_pending_payload(out, src_group_rank, route_key, expected):
+            self._recv_peer_seq[expected_key] = expected
             self._trace_event(
                 f"recv-pending src={src_group_rank} dst={self._rank} route={route_key} seq={expected}"
             )
-            self._recv_peer_seq[expected_key] = expected
             return
-        spin = 0
-        matched_slot = None
-        matched_ready = None
-        # Diagnostic timeout is opt-in. Default (0) waits indefinitely.
-        max_spin = int(os.environ.get("MEGATRON_NVSHMEM_WAIT_MAX_SPIN", "0"))
-        while matched_slot is None:
-            for slot in range(self._peer_slots):
-                ch_ready = f"peer_ready_from_{src_group_rank}_slot_{slot}"
-                ready_local = self._get_mailbox(tensor_shape, ch_ready)
-                seen_tag = int(ready_local.item())
-                if seen_tag == 0:
-                    continue
-                if seen_tag == expected_tag:
-                    matched_slot = slot
-                    matched_ready = ready_local
-                    break
-                # Receive-and-stash unexpected message to free the slot.
-                s_sid, r_sid, m_sid, q_seq = self._decode_ready_tag(seen_tag)
-                stash_route = self._route_from_tag(s_sid, r_sid, m_sid, route_key)
-                stash_key = (src_group_rank, self._rank, shape_key, stash_route, q_seq)
-                if stash_key not in self._pending_peer_payloads:
-                    if self._pending_peer_payloads_max <= 0 or len(self._pending_peer_payloads) < self._pending_peer_payloads_max:
-                        ch_data_seen = f"peer_data_from_{src_group_rank}_slot_{slot}"
-                        local_seen = self._get_mailbox(tensor_shape, ch_data_seen)
-                        self._pending_peer_payloads[stash_key] = local_seen.clone()
-                        self._trace_event(
-                            f"stash src={src_group_rank} dst={self._rank} route={stash_route} seq={q_seq} slot={slot}"
-                        )
-                        with torch.no_grad():
-                            ready_local.zero_()
-                    else:
-                        if not self._pending_overflow_warned:
-                            self._pending_overflow_warned = True
-                            self._trace_event(
-                                f"warn pending-overflow size={len(self._pending_peer_payloads)} "
-                                f"limit={self._pending_peer_payloads_max}; stop stashing unexpected payloads"
-                            )
-            if max_spin > 0:
-                spin += 1
-            if max_spin > 0 and spin >= max_spin:
-                seen_tag = 0
-                seen_slot = -1
-                for slot in range(self._peer_slots):
-                    ch_ready = f"peer_ready_from_{src_group_rank}_slot_{slot}"
-                    cand = int(self._get_mailbox(tensor_shape, ch_ready).item())
-                    if cand != 0:
-                        seen_tag = cand
-                        seen_slot = slot
-                        break
-                s_sid, r_sid, m_sid, q_seq = self._decode_ready_tag(seen_tag)
-                if isinstance(route_key, tuple) and len(route_key) == 2:
-                    exp_s, exp_r, exp_m = route_key[0], route_key[1], 0
-                elif isinstance(route_key, tuple) and len(route_key) == 3:
-                    exp_s, exp_r, exp_m = route_key
-                else:
-                    exp_s, exp_r, exp_m = (None, None, None)
-                raise RuntimeError(
-                    "NVSHMEM peer recv wait timeout: sender not reached yet or mailbox collision. "
-                    f"src_pe={src_group_rank} dst_pe={self._rank} slot={seen_slot} "
-                    f"expected_tag={expected_tag} expected_route=({exp_s},{exp_r},{exp_m}) expected_seq={expected} "
-                    f"seen_tag={seen_tag} seen_route=({s_sid},{r_sid},{m_sid}) seen_seq={q_seq}"
-                )
+
+        slot = self._slot_for_route(route_key, expected)
+        expected_bytes = self._shape_nbytes(tensor_shape)
+        if expected_bytes > self._slot_bytes:
+            raise RuntimeError(
+                f"NVSHMEM P2P route={route_key} expected recv size {expected_bytes} bytes exceeds slot size "
+                f"{self._slot_bytes} bytes. Configure MEGATRON_NVSHMEM_P2P_BUFFER_BYTES for this run."
+            )
+
+        slot = self._drain_ready_slots(
+            src_group_rank, expected_route=route_key, expected_seq=expected
+        )
+        if slot is None:
+            slot = self._slot_for_route(route_key, expected, src_group_rank=src_group_rank)
+            self._trace_event(
+                f"recv-wait src={src_group_rank} dst={self._rank} route={route_key} "
+                f"seq={expected} slot={slot}"
+            )
+            ready_local = self._ready_flags[slot]
+            self._call_nvshmem_wait_until(ready_local, expected_tag, exact=True)
+        self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
         self._trace_event(
-            f"recv src={src_group_rank} dst={self._rank} route={route_key} seq={expected} slot={matched_slot}"
+            f"recv src={src_group_rank} dst={self._rank} route={route_key} "
+            f"seq={expected} slot={slot} bytes={expected_bytes}"
         )
         self._recv_peer_seq[expected_key] = expected
 
-        ch_data = f"peer_data_from_{src_group_rank}_slot_{matched_slot}"
-        local = self._get_mailbox(tensor_shape, ch_data)
-        # Avoid in-place on a leaf that requires_grad (autograd forbids copy_ on such leaves).
+        local = self._slot_slice(slot, expected_bytes)
         with torch.no_grad():
-            out.copy_(local)
-            # Mark this slot as reusable after payload is consumed.
-            matched_ready.zero_()
+            out.view(torch.uint8).reshape(-1).copy_(local, non_blocking=True)
+            self._release_slot(slot)
 
-    def _recv_peer_tensor(self, tensor_shape: Shape, src_group_rank: int, route_key=None):
+    def _recv_peer_tensor(
+        self,
+        tensor_shape: Shape,
+        src_group_rank: int,
+        route_key=None,
+        *,
+        requires_grad: bool = True,
+    ):
         out = torch.empty(
             tuple(tensor_shape) if not isinstance(tensor_shape, torch.Size) else tensor_shape,
             dtype=self.config.pipeline_dtype,
             device=torch.cuda.current_device(),
-            requires_grad=True,
+            requires_grad=requires_grad,
         )
         self._recv_peer_tensor_into(out, tensor_shape, src_group_rank, route_key=route_key)
         return out
@@ -1516,6 +1843,7 @@ class NvshmemP2PCommunicator:
         sender_sid=None,
         recver_sid=None,
         mid=None,
+        requires_grad: bool = True,
     ):
         """Match ``P2PCommunicator``: return preallocated buffers; completion in ``handle.wait()``."""
         unwrap_tensor_shapes = False
@@ -1537,7 +1865,7 @@ class NvshmemP2PCommunicator:
                     _shape_tuple(s),
                     dtype=self.config.pipeline_dtype,
                     device=torch.cuda.current_device(),
-                    requires_grad=True,
+                    requires_grad=requires_grad,
                 )
                 for s in tensor_shapes
             ]
@@ -1556,7 +1884,7 @@ class NvshmemP2PCommunicator:
                 _shape_tuple(s),
                 dtype=self.config.pipeline_dtype,
                 device=torch.cuda.current_device(),
-                requires_grad=True,
+                requires_grad=requires_grad,
             )
             recvs.append(out)
             reqs.append(
@@ -1662,3 +1990,110 @@ class NvshmemP2PCommunicator:
                 inp, _, _ = self._communicate(None, t, True, False, s)
                 out.append(inp)
         return out[0] if unwrap_input_tensor_grads else out
+
+
+class OctoPipeP2PCommunicator(NvshmemP2PCommunicator):
+    """Comp-driven NVSHMEM P2P helper for OctoPipe schedules.
+
+    This exposes a non-blocking ``try_recv_tensor`` path so the schedule can
+    check local/staged payloads before deciding to wait.  The underlying slot
+    protocol and route metadata are inherited from ``NvshmemP2PCommunicator``.
+    """
+
+    def _route_kwargs(self, sender_sid, recver_sid, mid):
+        return {"sender_sid": sender_sid, "recver_sid": recver_sid, "mid": mid}
+
+    def try_recv_tensor(
+        self,
+        tensor_shapes,
+        recv_src_rank,
+        *,
+        sender_sid=None,
+        recver_sid=None,
+        mid=None,
+        requires_grad: bool = True,
+    ):
+        unwrap_tensor_shapes = False
+        if is_single_shape(tensor_shapes):
+            unwrap_tensor_shapes = True
+            tensor_shapes = [tensor_shapes]
+
+        src_group_rank = self._resolve_peer_group_rank(recv_src_rank)
+        route_key = self._msg_route_key(sender_sid=sender_sid, recver_sid=recver_sid, mid=mid)
+        self._validate_route_key(route_key)
+
+        def _shape_tuple(s):
+            return tuple(s) if not isinstance(s, torch.Size) else tuple(s)
+
+        if src_group_rank == self._rank:
+            key = (self._rank, self._rank, route_key)
+            q = self._local_peer_queues.get(key)
+            if q is None or len(q) == 0:
+                return None
+            payload = q.pop(0)
+            outs = []
+            if len(payload) != len(tensor_shapes):
+                raise RuntimeError(
+                    f"OctoPipe local recv length mismatch: {len(payload)} vs {len(tensor_shapes)}"
+                )
+            for t, s in zip(payload, tensor_shapes):
+                if tuple(t.shape) != tuple(s):
+                    raise RuntimeError(
+                        f"OctoPipe local recv shape mismatch: tensor={tuple(t.shape)} expected={tuple(s)}"
+                    )
+                out = torch.empty(
+                    _shape_tuple(s),
+                    dtype=self.config.pipeline_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=requires_grad,
+                )
+                with torch.no_grad():
+                    out.copy_(t)
+                outs.append(out)
+            return outs[0] if unwrap_tensor_shapes else outs
+
+        outs = []
+        expected_key = (src_group_rank, self._rank, route_key)
+        expected = self._recv_peer_seq.get(expected_key, 0) + 1
+        expected_tag = self._ready_tag(route_key, expected)
+
+        for s in tensor_shapes:
+            out = torch.empty(
+                _shape_tuple(s),
+                dtype=self.config.pipeline_dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=requires_grad,
+            )
+            if self._try_pop_pending_payload(out, src_group_rank, route_key, expected):
+                self._recv_peer_seq[expected_key] = expected
+                outs.append(out)
+                expected += 1
+                expected_tag = self._ready_tag(route_key, expected)
+                continue
+
+            slot = self._slot_for_route(route_key, expected, src_group_rank=src_group_rank)
+            ready = int(self._ready_flags[slot][0].item())
+            if ready != expected_tag:
+                return None
+
+            expected_bytes = self._shape_nbytes(s)
+            self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
+            local = self._slot_slice(slot, expected_bytes)
+            with torch.no_grad():
+                out.view(torch.uint8).reshape(-1).copy_(local, non_blocking=True)
+                self._release_slot(slot)
+            self._recv_peer_seq[expected_key] = expected
+            outs.append(out)
+            expected += 1
+            expected_tag = self._ready_tag(route_key, expected)
+
+        return outs[0] if unwrap_tensor_shapes else outs
+
+    def recv_tensor_blocking(self, tensor_shapes, recv_src_rank, **route_kwargs):
+        result = self.try_recv_tensor(tensor_shapes, recv_src_rank, **route_kwargs)
+        if result is not None:
+            return result
+        recvs, handles = self.recv_tensor_async(tensor_shapes, recv_src_rank, **route_kwargs)
+        for handle in handles:
+            handle.wait()
+        return recvs
