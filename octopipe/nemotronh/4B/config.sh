@@ -83,7 +83,6 @@ LOG_ARGS=(
     --eval-interval $EVAL_INTERVAL
     --log-throughput
     --profile
-    # --profile-layer-time
     --profile-ranks 0 1 2 3
     --use-pytorch-profiler
     --profile-step-start 5

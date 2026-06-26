@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import atexit
 import contextlib
 import inspect
 import os
@@ -51,6 +52,129 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+class OctoPipeStageTimeProfiler:
+    """Low-overhead CUDA-event timing for OctoPipe f/b/w stage workloads.
+
+    The profiler is intentionally env-gated.  It records CUDA events during
+    sampled steps, aggregates completed events asynchronously, and prints one
+    summary at process exit by default.
+    """
+
+    def __init__(self, pp_rank: int):
+        self.pp_rank = pp_rank
+        self.enabled = os.environ.get("ENABLE_OCTOPIPE_PROFILER", "0") == "1"
+        self.interval = max(1, int(os.environ.get("OCTOPIPE_STAGE_TIME_INTERVAL", "1")))
+        self.warmup = max(0, int(os.environ.get("OCTOPIPE_STAGE_TIME_WARMUP", "10")))
+        self.step = 0
+        self._capture = False
+        self._events = []
+        self._pending = []
+        self._summary = {}
+        self._finalized = False
+        if self.enabled:
+            atexit.register(self.finalize)
+
+    def start_step(self):
+        if not self.enabled:
+            return
+        self.step += 1
+        self._drain_ready_events()
+        self._capture = self.step > self.warmup and self.step % self.interval == 0
+        self._events = []
+
+    def begin(self, sid: int, wtype: str, mid: int):
+        if not self.enabled or not self._capture:
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        token = (int(sid), str(wtype), int(mid), start, end)
+        return token
+
+    def end(self, token):
+        if token is None:
+            return
+        token[4].record()
+        self._events.append(token)
+
+    def call(self, sid: int, wtype: str, mid: int, func, *args, **kwargs):
+        token = self.begin(sid, wtype, mid)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            self.end(token)
+
+    def finish_step(self):
+        if not self.enabled:
+            return
+        if self._capture and self._events:
+            self._pending.append((self.step, self._events))
+        self._events = []
+        self._capture = False
+        self._drain_ready_events()
+
+    def finalize(self):
+        if not self.enabled or self._finalized:
+            return
+        self._finalized = True
+        self._drain_ready_events(force=True)
+        self._print_summary()
+
+    def _drain_ready_events(self, force: bool = False):
+        if not self._pending:
+            return
+        remaining = []
+        for step, events in self._pending:
+            if force:
+                try:
+                    for _, _, _, _, end in events:
+                        end.synchronize()
+                except RuntimeError:
+                    remaining.append((step, events))
+                    continue
+            elif not all(end.query() for _, _, _, _, end in events):
+                remaining.append((step, events))
+                continue
+            self._accumulate_events(events)
+        self._pending = remaining
+
+    def _accumulate_events(self, events):
+        for sid, wtype, _mid, start, end in events:
+            elapsed_ms = start.elapsed_time(end)
+            stats = self._summary.setdefault(sid, {}).setdefault(
+                wtype, {"count": 0, "sum": 0.0, "min": float("inf"), "max": 0.0}
+            )
+            stats["count"] += 1
+            stats["sum"] += elapsed_ms
+            stats["min"] = min(stats["min"], elapsed_ms)
+            stats["max"] = max(stats["max"], elapsed_ms)
+
+    def _print_summary(self):
+        if not self._summary:
+            return
+        try:
+            global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        except RuntimeError:
+            global_rank = -1
+        for sid in sorted(self._summary):
+            parts = []
+            for wtype in ("f", "b", "w"):
+                stats = self._summary[sid].get(wtype)
+                if stats is None:
+                    continue
+                avg = stats["sum"] / max(1, stats["count"])
+                parts.append(
+                    f"{wtype}:count={stats['count']} sum={stats['sum']:.3f}ms "
+                    f"avg={avg:.3f}ms min={stats['min']:.3f}ms max={stats['max']:.3f}ms"
+                )
+            if parts:
+                print(
+                    f"[octopipe-stage-time][rank={global_rank} pp_rank={self.pp_rank} "
+                    f"steps={self.step} sid={sid}] " + " | ".join(parts),
+                    flush=True,
+                )
 
 
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
@@ -720,6 +844,118 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return first_val_step and cond
     else:
         return cond
+
+
+def _octopipe_f_comp(
+    *,
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches: int,
+    input_tensor,
+    forward_data_store,
+    config,
+    cp_group_size: int,
+    collect_non_loss_data: bool,
+    checkpoint_activations_microbatch,
+    is_first_microbatch: bool,
+    current_microbatch: int,
+    is_last_stage: bool,
+    profiler,
+    sid: int,
+    wtype: str,
+    mid: int,
+):
+    """Run one OctoPipe forward compute workload, optionally timed by CUDA events."""
+    if profiler is None:
+        return forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size=cp_group_size,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            is_first_microbatch=is_first_microbatch,
+            current_microbatch=current_microbatch,
+            is_last_stage=is_last_stage,
+        )
+    return profiler.call(
+        sid,
+        wtype,
+        mid,
+        forward_step,
+        forward_step_func,
+        data_iterator,
+        model,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        config,
+        cp_group_size=cp_group_size,
+        collect_non_loss_data=collect_non_loss_data,
+        checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+        is_first_microbatch=is_first_microbatch,
+        current_microbatch=current_microbatch,
+        is_last_stage=is_last_stage,
+    )
+
+
+def _octopipe_b_comp(
+    *,
+    input_tensor,
+    output_tensor,
+    output_tensor_grad,
+    config,
+    octopipe_bwd_splitting: bool,
+    model_chunk,
+    chunk: int,
+    profiler,
+    sid: int,
+    wtype: str,
+    mid: int,
+):
+    """Run one OctoPipe backward compute workload, optionally timed by CUDA events."""
+    if profiler is None:
+        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        if octopipe_bwd_splitting:
+            _register_octopipe_wgrad_task(model_chunk, chunk=chunk)
+        return input_tensor_grad
+
+    def _run_backward():
+        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        if octopipe_bwd_splitting:
+            _register_octopipe_wgrad_task(model_chunk, chunk=chunk)
+        return input_tensor_grad
+
+    return profiler.call(sid, wtype, mid, _run_backward)
+
+
+def _octopipe_w_comp(
+    *,
+    chunk: int,
+    seq_split_idx: int = 0,
+    strict: bool = True,
+    profiler,
+    sid: int,
+    wtype: str,
+    mid: int,
+):
+    """Run one OctoPipe weight-gradient compute workload, optionally timed by CUDA events."""
+    if profiler is None:
+        return WeightGradStore.pop(chunk=chunk, seq_split_idx=seq_split_idx, strict=strict)
+    return profiler.call(
+        sid,
+        wtype,
+        mid,
+        WeightGradStore.pop,
+        chunk=chunk,
+        seq_split_idx=seq_split_idx,
+        strict=strict,
+    )
 
 
 def forward_backward_no_pipelining(
@@ -3125,6 +3361,14 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
         bwd_dst = cached["bwd_dst"]
     comp_workloads = cached["comp_workloads"]
     stage_global_ranks = cached["stage_global_ranks"]
+    stage_time_profiler = None
+    if os.environ.get("ENABLE_OCTOPIPE_PROFILER", "0") == "1":
+        profiler_key = (pp_rank, "stage_time_profiler")
+        stage_time_profiler = runtime_cache.get(profiler_key)
+        if stage_time_profiler is None:
+            stage_time_profiler = OctoPipeStageTimeProfiler(pp_rank)
+            runtime_cache[profiler_key] = stage_time_profiler
+        stage_time_profiler.start_step()
 
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(
@@ -3232,20 +3476,24 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
                     )
                     input_tensors[mid][sid] = input_tensor
 
-            output_tensor, num_tokens = forward_step(
-                forward_step_func,
-                data_iterator[cid],
-                model[cid],
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
+            output_tensor, num_tokens = _octopipe_f_comp(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator[cid],
+                model=model[cid],
+                num_microbatches=num_microbatches,
+                input_tensor=input_tensor,
+                forward_data_store=forward_data_store,
+                config=config,
                 cp_group_size=pg_collection.cp.size(),
                 collect_non_loss_data=collect_non_loss_data,
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, mid == 0),
                 current_microbatch=mid,
                 is_last_stage=sid == last_stage_sid,
+                profiler=stage_time_profiler,
+                sid=sid,
+                wtype=wtype,
+                mid=mid,
             )
             total_num_tokens += num_tokens
             if not forward_only:
@@ -3271,9 +3519,19 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
 
             input_tensor = None if sid == first_stage_sid else input_tensors[mid][sid]
             output_tensor = output_tensors[mid][sid]
-            input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-            if octopipe_bwd_splitting:
-                _register_octopipe_wgrad_task(model[cid], chunk=cid)
+            input_tensor_grad = _octopipe_b_comp(
+                input_tensor=input_tensor,
+                output_tensor=output_tensor,
+                output_tensor_grad=output_tensor_grad,
+                config=config,
+                octopipe_bwd_splitting=octopipe_bwd_splitting,
+                model_chunk=model[cid],
+                chunk=cid,
+                profiler=stage_time_profiler,
+                sid=sid,
+                wtype=wtype,
+                mid=mid,
+            )
             input_tensor_grads[mid][sid] = input_tensor_grad
 
             dst_sid = bwd_dst.get((mid, sid, 'b'))
@@ -3285,7 +3543,15 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
                 raise ValueError(
                     "OctoPipe schedule contains a 'w' workload, but --octopipe-bwd-splitting is disabled."
                 )
-            WeightGradStore.pop(chunk=cid)
+            _octopipe_w_comp(
+                chunk=cid,
+                seq_split_idx=0,
+                strict=True,
+                profiler=stage_time_profiler,
+                sid=sid,
+                wtype=wtype,
+                mid=mid,
+            )
         else:
             raise ValueError(f"comp Workload Type Error: {wtype}")
 
@@ -3317,6 +3583,9 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
+
+    if stage_time_profiler is not None:
+        stage_time_profiler.finish_step()
 
     if octopipe_bwd_splitting:
         WeightGradStore.reset()
