@@ -2580,8 +2580,11 @@ def forward_backward_pipelining_of_octopipe(
         octopipe_config["did->sid"][i]: a list of stage idxs of device i,
     """
 
-    assert isinstance(model, list), "OctoPipe pipeline parallelism expected model chunking"
-    assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
+    if isinstance(model, list):
+        assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
+    else:
+        assert isinstance(model, torch.nn.Module), "model must be a torch.nn.Module or a list of modules"
+        model = [model]
     if not isinstance(data_iterator, list):
         data_iterator = [data_iterator]
     
@@ -2651,6 +2654,18 @@ def forward_backward_pipelining_of_octopipe(
     stage_chunk_mapping = octopipe_config["sid->cid"]
     first_stage_sid = 0
     last_stage_sid = max(list(stage_chunk_mapping.keys()))
+    local_cids = [stage_chunk_mapping[sid] for sid in stages]
+    max_local_cid = max(local_cids) if local_cids else -1
+    if max_local_cid >= len(model):
+        raise RuntimeError(
+            f"OctoPipe local stage mapping requires model chunk {max_local_cid}, "
+            f"but this rank only has {len(model)} model chunk(s)."
+        )
+    if max_local_cid >= len(data_iterator):
+        raise RuntimeError(
+            f"OctoPipe local stage mapping requires data iterator chunk {max_local_cid}, "
+            f"but this rank only has {len(data_iterator)} data iterator chunk(s)."
+        )
     if isinstance(p2p_communicator, NvshmemP2PCommunicator):
         p2p_communicator.register_workload_routes(workloads)
     
@@ -2992,8 +3007,11 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
     after compute.
     """
 
-    assert isinstance(model, list), "OctoPipe pipeline parallelism expected model chunking"
-    assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
+    if isinstance(model, list):
+        assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
+    else:
+        assert isinstance(model, torch.nn.Module), "model must be a torch.nn.Module or a list of modules"
+        model = [model]
     if not isinstance(data_iterator, list):
         data_iterator = [data_iterator]
 
@@ -3045,6 +3063,18 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
     stage_chunk_mapping = octopipe_config["sid->cid"]
     first_stage_sid = 0
     last_stage_sid = max(list(stage_chunk_mapping.keys()))
+    local_cids = [stage_chunk_mapping[sid] for sid in stages]
+    max_local_cid = max(local_cids) if local_cids else -1
+    if max_local_cid >= len(model):
+        raise RuntimeError(
+            f"OctoPipe local stage mapping requires model chunk {max_local_cid}, "
+            f"but this rank only has {len(model)} model chunk(s)."
+        )
+    if max_local_cid >= len(data_iterator):
+        raise RuntimeError(
+            f"OctoPipe local stage mapping requires data iterator chunk {max_local_cid}, "
+            f"but this rank only has {len(data_iterator)} data iterator chunk(s)."
+        )
     p2p_communicator.register_workload_routes(workloads)
 
     runtime_cache = octopipe_config.setdefault("_octopipe_nvshmem_runtime_cache", {})
