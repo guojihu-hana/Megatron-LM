@@ -28,6 +28,27 @@ def test_put_task_flush_pop_executes_fifo_groups():
     assert executed == ["b0-w0", "b0-w1", "b1-w0"]
 
 
+def test_tagged_tasks_pop_by_tag_not_fifo_order():
+    executed = []
+
+    WeightGradStore.enable_split_bw()
+    WeightGradStore.put_task(lambda: executed.append("mid1"), tag=1)
+    WeightGradStore.flush(tag=1)
+    WeightGradStore.put_task(lambda: executed.append("mid0"), tag=0)
+    WeightGradStore.flush(tag=0)
+
+    assert WeightGradStore.queue_size() == 0
+    assert WeightGradStore.pending_count() == 2
+
+    WeightGradStore.pop(tag=0)
+    assert executed == ["mid0"]
+    assert WeightGradStore.pending_count() == 1
+
+    WeightGradStore.pop(tag=1)
+    assert executed == ["mid0", "mid1"]
+    assert WeightGradStore.pending_count() == 0
+
+
 def test_pop_strict_raises_on_empty_queue():
     WeightGradStore.enable_split_bw()
 

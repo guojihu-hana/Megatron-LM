@@ -138,6 +138,20 @@ def ordered_layer_types(counts_by_sid: Mapping[int, Counter]) -> List[str]:
     return ordered
 
 
+def display_layers_by_sid(
+    layers_by_sid: Mapping[int, str], default_e_added: bool, default_l_added: bool
+) -> Dict[int, str]:
+    display = dict(layers_by_sid)
+    if not display:
+        return display
+    ordered_sids = sorted(display)
+    if default_e_added:
+        display[ordered_sids[0]] = "E" + display[ordered_sids[0]]
+    if default_l_added:
+        display[ordered_sids[-1]] = display[ordered_sids[-1]] + "L"
+    return display
+
+
 def gaussian_solve(matrix: List[List[float]], vector: List[float]) -> List[float]:
     n = len(vector)
     augmented = [row[:] + [rhs] for row, rhs in zip(matrix, vector)]
@@ -474,16 +488,15 @@ def print_text_report(
     if not show_stage_report:
         return
 
+    display_layers = display_layers_by_sid(
+        parsed.layers_by_sid, default_e_added=default_e_added, default_l_added=default_l_added
+    )
     print()
     print("stage fit details:")
     header = f"{'sid':>4} {'layers':>12} {'op':>2} {'actual':>9} {'pred':>9} {'err':>9}"
     print(header)
     for sid in common_sids:
-        layer_summary = "".join(
-            layer_type * counts_by_sid[sid][layer_type]
-            for layer_type in layer_types
-            if counts_by_sid[sid].get(layer_type, 0)
-        )
+        layer_summary = display_layers.get(sid, "")
         for op in ("f", "b", "w"):
             item = residuals[op].get(sid)
             if item is None:

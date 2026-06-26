@@ -732,7 +732,7 @@ def _prepare_octopipe_bwd_splitting(config, workloads):
     return True
 
 
-def _register_octopipe_wgrad_task(model_chunk, chunk=0):
+def _register_octopipe_wgrad_task(model_chunk, chunk=0, tag=None):
     """Queue the chunk-level TE delayed weight-gradient computation."""
     if not WeightGradStore.split_bw():
         return
@@ -748,8 +748,8 @@ def _register_octopipe_wgrad_task(model_chunk, chunk=0):
             module.backward_dw()
 
     description = ",".join(type(module).__name__ for module in backward_dw_modules)
-    WeightGradStore.put_task(run_backward_dw, description=description, chunk=chunk)
-    WeightGradStore.flush(chunk=chunk)
+    WeightGradStore.put_task(run_backward_dw, description=description, chunk=chunk, tag=tag)
+    WeightGradStore.flush(chunk=chunk, tag=tag)
 
 
 def _collect_octopipe_backward_dw_modules(model_chunk):
@@ -922,13 +922,13 @@ def _octopipe_b_comp(
     if profiler is None:
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
         if octopipe_bwd_splitting:
-            _register_octopipe_wgrad_task(model_chunk, chunk=chunk)
+            _register_octopipe_wgrad_task(model_chunk, chunk=chunk, tag=(sid, mid))
         return input_tensor_grad
 
     def _run_backward():
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
         if octopipe_bwd_splitting:
-            _register_octopipe_wgrad_task(model_chunk, chunk=chunk)
+            _register_octopipe_wgrad_task(model_chunk, chunk=chunk, tag=(sid, mid))
         return input_tensor_grad
 
     return profiler.call(sid, wtype, mid, _run_backward)
@@ -946,7 +946,9 @@ def _octopipe_w_comp(
 ):
     """Run one OctoPipe weight-gradient compute workload, optionally timed by CUDA events."""
     if profiler is None:
-        return WeightGradStore.pop(chunk=chunk, seq_split_idx=seq_split_idx, strict=strict)
+        return WeightGradStore.pop(
+            chunk=chunk, seq_split_idx=seq_split_idx, strict=strict, tag=(sid, mid)
+        )
     return profiler.call(
         sid,
         wtype,
@@ -955,6 +957,7 @@ def _octopipe_w_comp(
         chunk=chunk,
         seq_split_idx=seq_split_idx,
         strict=strict,
+        tag=(sid, mid),
     )
 
 
@@ -3095,7 +3098,7 @@ def forward_backward_pipelining_of_octopipe(
                     input_tensor, output_tensor, output_tensor_grad, config
                 )
                 if octopipe_bwd_splitting:
-                    _register_octopipe_wgrad_task(model[cid], chunk=cid)
+                    _register_octopipe_wgrad_task(model[cid], chunk=cid, tag=(sid, mid))
 
                 input_tensor_grads[mid][sid] = input_tensor_grad
             elif wtype == 'w':
@@ -3105,7 +3108,7 @@ def forward_backward_pipelining_of_octopipe(
                         "OctoPipe schedule contains a 'w' workload, but "
                         "--octopipe-bwd-splitting is disabled."
                     )
-                WeightGradStore.pop(chunk=cid)
+                WeightGradStore.pop(chunk=cid, tag=(sid, mid))
             else:
                 raise ValueError(f"{op} Workload Type Error: {wtype}")
 

@@ -45,10 +45,11 @@ def test_register_octopipe_wgrad_task_flushes_chunk_backward_dw():
     model_chunk = SimpleNamespace(backward_dw=lambda: calls.append("backward_dw"))
     WeightGradStore.enable_split_bw()
 
-    schedules._register_octopipe_wgrad_task(model_chunk, chunk=0)
+    schedules._register_octopipe_wgrad_task(model_chunk, chunk=0, tag=(3, 7))
 
-    assert WeightGradStore.queue_size(chunk=0) == 1
-    WeightGradStore.pop(chunk=0)
+    assert WeightGradStore.queue_size(chunk=0) == 0
+    assert WeightGradStore.pending_count(chunk=0, tag=(3, 7)) == 1
+    WeightGradStore.pop(chunk=0, tag=(3, 7))
     assert calls == ["backward_dw"]
 
 
@@ -78,8 +79,8 @@ def test_register_octopipe_wgrad_task_traverses_chunk_submodules_without_duplica
             self.second = Leaf("second")
 
     WeightGradStore.enable_split_bw()
-    schedules._register_octopipe_wgrad_task(Chunk(), chunk=0)
+    schedules._register_octopipe_wgrad_task(Chunk(), chunk=0, tag=(0, 0))
 
-    WeightGradStore.pop(chunk=0)
+    WeightGradStore.pop(chunk=0, tag=(0, 0))
 
     assert calls == ["second", "parent"]
