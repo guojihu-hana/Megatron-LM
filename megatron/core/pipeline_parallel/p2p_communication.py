@@ -1054,11 +1054,16 @@ class NvshmemP2PCommunicator:
         assert self._peer_slots >= 2, "MEGATRON_NVSHMEM_P2P_NUM_SLOTS must be >= 2"
         self._trace_max = int(os.environ.get("MEGATRON_NVSHMEM_TRACE_MAX", "-1"))
         self._trace_count = 0
+        self._quiet_after_send = os.environ.get("MEGATRON_NVSHMEM_P2P_QUIET_AFTER_SEND", "0") == "1"
+        self._validate_expected_meta = (
+            os.environ.get("MEGATRON_NVSHMEM_VALIDATE_EXPECTED_META", "0") == "1"
+        )
         self._total_slots = self._world * self._peer_slots
         self._cuda_wait_until = None
         self._nv_bindings = None
         self._nv_cmp_eq = None
         self._nv_cmp_ge = None
+        self._nv_signal_set = None
         self._init_nvshmem()
         self._nvshmem_initialized = True
 
@@ -1100,6 +1105,7 @@ class NvshmemP2PCommunicator:
         self._nv_bindings = nvshmem_bindings
         self._nv_cmp_eq = nvshmem_bindings.Cmp_type.CMP_EQ
         self._nv_cmp_ge = nvshmem_bindings.Cmp_type.CMP_GE
+        self._nv_signal_set = nvshmem_bindings.Signal_op.SIGNAL_SET
         self._init_p2p_pool()
         torch.distributed.barrier(group=self.pp_group)
 
@@ -1292,9 +1298,17 @@ class NvshmemP2PCommunicator:
         expected_slot = None
         start = int(src_group_rank) * self._peer_slots
         end = start + self._peer_slots
+        expected_tag = (
+            self._ready_tag(expected_route, expected_seq)
+            if expected_route is not None and expected_seq is not None
+            else None
+        )
         for slot in range(start, end):
             ready = int(self._ready_flags[slot][0].item())
             if ready == 0:
+                continue
+            if expected_tag is not None and ready == expected_tag:
+                expected_slot = slot
                 continue
             meta = self._read_slot_meta(slot)
             route_key = (meta["sender_sid"], meta["recver_sid"], meta["mid"])
@@ -1677,6 +1691,46 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
             return
         self._get_cuda_wait_until()(ready, int(expected), exact)
 
+    def _stream_handle(self) -> int:
+        return int(self._stream.__cuda_stream__()[1])
+
+    def _putmem_on_stream(self, dst: torch.Tensor, src: torch.Tensor, num_bytes: int, remote_pe: int) -> bool:
+        putmem = getattr(self._nv_bindings, "putmem_on_stream", None)
+        if putmem is None:
+            return False
+        putmem(
+            dst.data_ptr(),
+            src.data_ptr(),
+            int(num_bytes),
+            int(remote_pe),
+            self._stream_handle(),
+        )
+        return True
+
+    def _putmem_signal_on_stream(
+        self,
+        dst: torch.Tensor,
+        src: torch.Tensor,
+        num_bytes: int,
+        signal_addr: torch.Tensor,
+        signal_value: int,
+        remote_pe: int,
+    ) -> bool:
+        putmem_signal = getattr(self._nv_bindings, "putmem_signal_on_stream", None)
+        if putmem_signal is None or self._nv_signal_set is None:
+            return False
+        putmem_signal(
+            dst.data_ptr(),
+            src.data_ptr(),
+            int(num_bytes),
+            signal_addr.data_ptr(),
+            int(signal_value),
+            int(self._nv_signal_set),
+            int(remote_pe),
+            self._stream_handle(),
+        )
+        return True
+
     def _resolve_peer_group_rank(self, rank_maybe_global: int) -> int:
         # Prefer interpreting input as global rank if it belongs to this pp_group.
         # This avoids ambiguity when global rank id is in [0, pp_size).
@@ -1691,7 +1745,7 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
         )
 
     def _send_peer_tensor(self, t: torch.Tensor, dst_group_rank: int, route_key=None):
-        """Stage a tensor into a bounded NVSHMEM slot and mark it ready with explicit metadata."""
+        """Put a tensor into a bounded NVSHMEM slot and mark it ready with explicit metadata."""
         if dst_group_rank == self._rank:
             raise RuntimeError("NVSHMEM peer send does not support self-send")
         self._validate_route_key(route_key)
@@ -1716,22 +1770,48 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
         # the previous payload out and cleared the ready flag.
         self._wait_remote_slot_empty(dst_group_rank, slot)
 
-        send_src = self._send_buffer[:num_bytes]
-        send_src.copy_(t.view(torch.uint8).reshape(-1))
         dst_data = self._slot_slice(slot, num_bytes)
-        self._nv.put(dst=dst_data, src=send_src, remote_pe=dst_group_rank, stream=self._stream)
-        self._write_remote_slot_meta(slot, dst_group_rank, route_key, seq, num_bytes)
+        if not self._putmem_on_stream(dst_data, t, num_bytes, dst_group_rank):
+            send_src = self._send_buffer[:num_bytes]
+            send_src.copy_(t.view(torch.uint8).reshape(-1))
+            self._nv.put(dst=dst_data, src=send_src, remote_pe=dst_group_rank, stream=self._stream)
+
         with torch.no_grad():
-            self._tmp_ready.fill_(self._ready_tag(route_key, seq))
-        self._nv.put(
-            dst=self._ready_flags[slot],
-            src=self._tmp_ready,
-            remote_pe=dst_group_rank,
-            stream=self._stream,
-        )
-        # Ensure payload, metadata, and ready flag are ordered before the caller
-        # can enqueue dependent sends that may reuse the single local send buffer.
-        self._nv.quiet(stream=self._stream)
+            sender_sid, recver_sid, mid = route_key
+            self._tmp_meta[0].fill_(self._rank)
+            self._tmp_meta[1].fill_(int(sender_sid))
+            self._tmp_meta[2].fill_(int(recver_sid))
+            self._tmp_meta[3].fill_(int(mid))
+            self._tmp_meta[4].fill_(int(seq))
+            self._tmp_meta[5].fill_(int(num_bytes))
+            ready_tag = self._ready_tag(route_key, seq)
+        if not self._putmem_signal_on_stream(
+            self._meta[slot],
+            self._tmp_meta,
+            self._tmp_meta.numel() * self._tmp_meta.element_size(),
+            self._ready_flags[slot],
+            ready_tag,
+            dst_group_rank,
+        ):
+            self._nv.put(
+                dst=self._meta[slot],
+                src=self._tmp_meta,
+                remote_pe=dst_group_rank,
+                stream=self._stream,
+            )
+            with torch.no_grad():
+                self._tmp_ready.fill_(ready_tag)
+            self._nv.put(
+                dst=self._ready_flags[slot],
+                src=self._tmp_ready,
+                remote_pe=dst_group_rank,
+                stream=self._stream,
+            )
+        # Payload, metadata, ready signaling, and later source/staging reuse are
+        # ordered on this CUDA stream.  Keep an opt-in quiet for debugging or for
+        # NVSHMEM builds that require stronger local completion semantics.
+        if self._quiet_after_send:
+            self._nv.quiet(stream=self._stream)
 
     def _recv_peer_tensor_into(
         self, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int, route_key=None
@@ -1769,7 +1849,8 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
             )
             ready_local = self._ready_flags[slot]
             self._call_nvshmem_wait_until(ready_local, expected_tag, exact=True)
-        self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
+        if self._validate_expected_meta:
+            self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
         self._trace_event(
             f"recv src={src_group_rank} dst={self._rank} route={route_key} "
             f"seq={expected} slot={slot} bytes={expected_bytes}"
@@ -2077,7 +2158,8 @@ class OctoPipeP2PCommunicator(NvshmemP2PCommunicator):
                 return None
 
             expected_bytes = self._shape_nbytes(s)
-            self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
+            if self._validate_expected_meta:
+                self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
             local = self._slot_slice(slot, expected_bytes)
             with torch.no_grad():
                 out.view(torch.uint8).reshape(-1).copy_(local, non_blocking=True)
