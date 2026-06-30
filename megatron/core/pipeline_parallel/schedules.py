@@ -280,7 +280,7 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         from megatron.training import get_args
         args = get_args()
         if getattr(args, 'octopipe', False):
-            if os.environ.get("MEGATRON_NVSHMEM_P2P", "0") == "1":
+            if os.environ.get("OCTOPIPE_NVSHMEM_P2P", "1") == "1":
                 forward_backward_func = forward_backward_pipelining_of_octopipe_nvshmem
             else:
                 forward_backward_func = forward_backward_pipelining_of_octopipe
@@ -2465,7 +2465,7 @@ def forward_backward_pipelining_without_interleaving(
 
     if p2p_communicator is None and pg_collection is None:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
-        if os.environ.get("MEGATRON_NVSHMEM_P2P", "0") == "1":
+        if os.environ.get("OCTOPIPE_NVSHMEM_P2P", "1") == "1":
             p2p_communicator = NvshmemP2PCommunicator(pp_group=pp_group, config=config)
         else:
             p2p_communicator = P2PCommunicator(pp_group=pp_group, config=config)
@@ -2831,7 +2831,7 @@ def forward_backward_pipelining_of_octopipe(
     
     if p2p_communicator is None and pg_collection is None:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
-        if os.environ.get("MEGATRON_NVSHMEM_P2P", "0") == "1":
+        if os.environ.get("OCTOPIPE_NVSHMEM_P2P", "1") == "1":
             p2p_communicator = NvshmemP2PCommunicator(pp_group=pp_group, config=config)
         else:
             p2p_communicator = P2PCommunicator(pp_group=pp_group, config=config)
@@ -3256,14 +3256,14 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
 
     config = get_model_config(model[0])
     if (
-        os.environ.get("MEGATRON_NVSHMEM_P2P_BUFFER_BYTES") is None
-        and os.environ.get("MEGATRON_NVSHMEM_P2P_DEFAULT_BUFFER_BYTES") is None
+        os.environ.get("OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES") is None
+        and os.environ.get("OCTOPIPE_NVSHMEM_P2P_DEFAULT_BUFFER_BYTES") is None
     ):
         dtype_size = torch.empty((), dtype=config.pipeline_dtype).element_size()
-        buffer_factor = int(os.environ.get("MEGATRON_NVSHMEM_P2P_BUFFER_FACTOR", "1"))
+        buffer_factor = int(os.environ.get("OCTOPIPE_NVSHMEM_P2P_BUFFER_FACTOR", "1"))
         effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
         slot_bytes = buffer_factor * int(micro_batch_size) * int(effective_seq_length) * int(config.hidden_size) * dtype_size
-        os.environ["MEGATRON_NVSHMEM_P2P_DEFAULT_BUFFER_BYTES"] = str(slot_bytes)
+        os.environ["OCTOPIPE_NVSHMEM_P2P_DEFAULT_BUFFER_BYTES"] = str(slot_bytes)
 
     if p2p_communicator is None and pg_collection is None:
         pp_group = parallel_state.get_pipeline_model_parallel_group()

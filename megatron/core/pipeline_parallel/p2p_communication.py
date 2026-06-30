@@ -970,7 +970,8 @@ class NvshmemP2PCommunicator:
     **global ranks in the PP process group** (same convention as ``P2PCommunicator``).
     Internally, peers are mapped to NVSHMEM PE indices ``0 .. pp_size-1``.
 
-    Enabled via ``MEGATRON_NVSHMEM_P2P=1``; default NCCL path is unchanged when unset.
+    Enabled by default via ``OCTOPIPE_NVSHMEM_P2P=1``. Set
+    ``OCTOPIPE_NVSHMEM_P2P=0`` to use the NCCL path.
     """
 
     _instances = {}
@@ -1009,8 +1010,8 @@ class NvshmemP2PCommunicator:
         self._shape_initialized = set()
         self._stream = None
         self._nv = None
-        self._slot_bytes = int(os.environ.get("MEGATRON_NVSHMEM_P2P_BUFFER_BYTES", "0"))
-        self._buffer_factor = int(os.environ.get("MEGATRON_NVSHMEM_P2P_BUFFER_FACTOR", "1"))
+        self._slot_bytes = int(os.environ.get("OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES", "0"))
+        self._buffer_factor = int(os.environ.get("OCTOPIPE_NVSHMEM_P2P_BUFFER_FACTOR", "1"))
         self._pool_initialized = False
         self._data_slots = None
         self._send_buffer = None
@@ -1043,20 +1044,20 @@ class NvshmemP2PCommunicator:
         # Bound pending stash growth to avoid unbounded GPU clones under
         # prolonged out-of-order traffic.
         self._pending_peer_payloads_max = int(
-            os.environ.get("MEGATRON_NVSHMEM_PENDING_MAX", "256")
+            os.environ.get("OCTOPIPE_NVSHMEM_PENDING_MAX", "256")
         )
         self._pending_overflow_warned = False
         self._route_slots = {}
         self._route_slot_counts = {}
         self._registered_workloads_id = None
         # Fixed-size NVSHMEM staging slots for routed OctoPipe peer traffic.
-        self._peer_slots = int(os.environ.get("MEGATRON_NVSHMEM_P2P_NUM_SLOTS", "8"))
-        assert self._peer_slots >= 2, "MEGATRON_NVSHMEM_P2P_NUM_SLOTS must be >= 2"
-        self._trace_max = int(os.environ.get("MEGATRON_NVSHMEM_TRACE_MAX", "-1"))
+        self._peer_slots = int(os.environ.get("OCTOPIPE_NVSHMEM_P2P_NUM_SLOTS", "8"))
+        assert self._peer_slots >= 2, "OCTOPIPE_NVSHMEM_P2P_NUM_SLOTS must be >= 2"
+        self._trace_max = int(os.environ.get("OCTOPIPE_NVSHMEM_TRACE_MAX", "-1"))
         self._trace_count = 0
-        self._quiet_after_send = os.environ.get("MEGATRON_NVSHMEM_P2P_QUIET_AFTER_SEND", "0") == "1"
+        self._quiet_after_send = os.environ.get("OCTOPIPE_NVSHMEM_P2P_QUIET_AFTER_SEND", "0") == "1"
         self._validate_expected_meta = (
-            os.environ.get("MEGATRON_NVSHMEM_VALIDATE_EXPECTED_META", "0") == "1"
+            os.environ.get("OCTOPIPE_NVSHMEM_VALIDATE_EXPECTED_META", "0") == "1"
         )
         self._total_slots = self._world * self._peer_slots
         self._cuda_wait_until = None
@@ -1077,7 +1078,7 @@ class NvshmemP2PCommunicator:
         # Keep the single-node smoke-test workaround opt-in.  For production
         # multi-node runs, forcing NVSHMEM_REMOTE_TRANSPORT=none disables the
         # remote transport path and can prevent inter-node NVSHMEM P2P.
-        if os.environ.get("MEGATRON_NVSHMEM_SINGLE_NODE", "0") == "1":
+        if os.environ.get("OCTOPIPE_NVSHMEM_SINGLE_NODE", "0") == "1":
             os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
 
         max_ctas = os.environ.get("NVSHMEM_MAX_CTAS")
@@ -1121,12 +1122,12 @@ class NvshmemP2PCommunicator:
             # conservative default and let users override it for 4*b*s*h / 8*b*s*h runs.
             self._slot_bytes = int(
                 os.environ.get(
-                    "MEGATRON_NVSHMEM_P2P_DEFAULT_BUFFER_BYTES",
+                    "OCTOPIPE_NVSHMEM_P2P_DEFAULT_BUFFER_BYTES",
                     str(inferred_bytes if inferred_bytes is not None else 256 * 1024 * 1024),
                 )
             )
         if self._slot_bytes <= 0:
-            raise RuntimeError("MEGATRON_NVSHMEM_P2P_BUFFER_BYTES must be positive")
+            raise RuntimeError("OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES must be positive")
 
         torch.distributed.barrier(group=self.pp_group)
         self._data_slots = [self._nv.tensor((self._slot_bytes,), dtype=torch.uint8) for _ in range(self._total_slots)]
@@ -1200,8 +1201,8 @@ class NvshmemP2PCommunicator:
         if num_bytes < 0 or num_bytes > self._slot_bytes:
             raise RuntimeError(
                 f"NVSHMEM P2P message size {num_bytes} bytes exceeds configured slot size "
-                f"{self._slot_bytes} bytes. Increase MEGATRON_NVSHMEM_P2P_BUFFER_BYTES "
-                "or reduce MEGATRON_NVSHMEM_P2P_BUFFER_FACTOR-derived payload size."
+                f"{self._slot_bytes} bytes. Increase OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES "
+                "or reduce OCTOPIPE_NVSHMEM_P2P_BUFFER_FACTOR-derived payload size."
             )
         return self._data_slots[slot][:num_bytes]
 
@@ -1274,7 +1275,7 @@ class NvshmemP2PCommunicator:
                 raise RuntimeError(
                     "NVSHMEM pending payload stash is full on rank "
                     f"{self._rank}: max={self._pending_peer_payloads_max}. "
-                    "Increase MEGATRON_NVSHMEM_PENDING_MAX."
+                    "Increase OCTOPIPE_NVSHMEM_PENDING_MAX."
                 )
             payload = torch.empty(
                 (meta["num_bytes"],), dtype=torch.uint8, device=torch.cuda.current_device()
@@ -1361,7 +1362,7 @@ class NvshmemP2PCommunicator:
         return (shape, str(self.config.pipeline_dtype))
 
     def _trace_event(self, message: str):
-        # MEGATRON_NVSHMEM_TRACE_MAX semantics:
+        # OCTOPIPE_NVSHMEM_TRACE_MAX semantics:
         #   <0 : disabled
         #    0 : unlimited
         #   >0 : print at most N lines per rank
@@ -1755,7 +1756,7 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
         if num_bytes > self._slot_bytes:
             raise RuntimeError(
                 f"NVSHMEM P2P route={route_key} tensor size {num_bytes} bytes exceeds slot size "
-                f"{self._slot_bytes} bytes. Configure MEGATRON_NVSHMEM_P2P_BUFFER_BYTES for this run."
+                f"{self._slot_bytes} bytes. Configure OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES for this run."
             )
 
         seq_key = (self._rank, dst_group_rank, route_key)
@@ -1835,7 +1836,7 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
         if expected_bytes > self._slot_bytes:
             raise RuntimeError(
                 f"NVSHMEM P2P route={route_key} expected recv size {expected_bytes} bytes exceeds slot size "
-                f"{self._slot_bytes} bytes. Configure MEGATRON_NVSHMEM_P2P_BUFFER_BYTES for this run."
+                f"{self._slot_bytes} bytes. Configure OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES for this run."
             )
 
         slot = self._drain_ready_slots(

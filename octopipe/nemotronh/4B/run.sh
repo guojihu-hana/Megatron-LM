@@ -10,8 +10,8 @@ export NNODES=$NODE_COUNT
 export NODE_RANK=$NODE_RANK
 export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 export PP_MODE=$PP_MODE
-# NVSHMEM PP P2P (schedules.NvshmemP2PCommunicator): export MEGATRON_NVSHMEM_P2P=1 before run
-export MEGATRON_NVSHMEM_P2P=${MEGATRON_NVSHMEM_P2P:-0}
+# NVSHMEM PP P2P (schedules.NvshmemP2PCommunicator): export OCTOPIPE_NVSHMEM_P2P=1 before run
+export OCTOPIPE_NVSHMEM_P2P=${OCTOPIPE_NVSHMEM_P2P:-1}
 export NVSHMEM_REMOTE_TRANSPORT=${NVSHMEM_REMOTE_TRANSPORT:-none}
 
 if [ -n "$TIME" ]; then
