@@ -3087,6 +3087,71 @@ def post_training_step_callbacks(
     return num_floating_point_operations_since_last_log_event
 
 
+def _pytorch_memory_profile_rank_enabled(args):
+    return len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks
+
+
+def _get_pytorch_memory_profile_path(args, iteration):
+    if args.pytorch_memory_profile_dir is not None:
+        profile_dir = Path(args.pytorch_memory_profile_dir)
+    elif args.tensorboard_dir is not None:
+        profile_dir = Path(f"{args.tensorboard_dir}/../torch_memory_profile")
+    else:
+        profile_dir = Path("torch_memory_profile")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    rank = torch.distributed.get_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    return profile_dir / f"memory_snapshot_rank_{rank}_pp_{pp_rank}_iter_{iteration}.pickle"
+
+
+def _set_pytorch_memory_history(enabled):
+    try:
+        torch.cuda.memory._record_memory_history(enabled="all" if enabled else None)
+    except TypeError:
+        torch.cuda.memory._record_memory_history(enabled)
+
+
+def _start_pytorch_memory_profile(args):
+    if args.pytorch_memory_profile_steps <= 0:
+        return False
+
+    if not _pytorch_memory_profile_rank_enabled(args):
+        return False
+
+    if not hasattr(torch.cuda.memory, "_record_memory_history") or not hasattr(
+        torch.cuda.memory, "_dump_snapshot"
+    ):
+        print_rank_0(
+            "WARNING: PyTorch CUDA memory history API is not available; "
+            "skipping PyTorch memory profile."
+        )
+        return False
+
+    _set_pytorch_memory_history(True)
+    print(
+        f"[Rank {torch.distributed.get_rank()}] PyTorch memory profile started "
+        f"for {args.pytorch_memory_profile_steps} training steps.",
+        flush=True,
+    )
+    return True
+
+
+def _stop_pytorch_memory_profile():
+    _set_pytorch_memory_history(False)
+
+
+def _dump_pytorch_memory_profile(args, iteration):
+    path = _get_pytorch_memory_profile_path(args, iteration)
+    torch.cuda.synchronize()
+    torch.cuda.memory._dump_snapshot(str(path))
+    _stop_pytorch_memory_profile()
+    print(
+        f"[Rank {torch.distributed.get_rank()}] PyTorch memory profile saved to {path}",
+        flush=True,
+    )
+
+
 def checkpoint_and_decide_exit(
     model,
     optimizer,
@@ -3513,6 +3578,8 @@ def train(
         prof.start()
 
     start_iteration = iteration
+    pytorch_memory_profile_start_iteration = iteration
+    pytorch_memory_profile_active = _start_pytorch_memory_profile(args)
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
@@ -3730,6 +3797,14 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+
+        if (
+            pytorch_memory_profile_active
+            and iteration - pytorch_memory_profile_start_iteration
+            >= args.pytorch_memory_profile_steps
+        ):
+            _dump_pytorch_memory_profile(args, iteration)
+            pytorch_memory_profile_active = False
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
@@ -3949,6 +4024,12 @@ def train(
     # Shutdown RL profiler and export summary
     if args.rl_profile:
         shutdown_rl_profiler()
+
+    if pytorch_memory_profile_active:
+        if iteration > pytorch_memory_profile_start_iteration:
+            _dump_pytorch_memory_profile(args, iteration)
+        else:
+            _stop_pytorch_memory_profile()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:

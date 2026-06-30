@@ -59,6 +59,12 @@ class ProfilingConfig:
     memory_snapshot_path: str = "snapshot.pickle"
     """Specifies where to dump the memory history pickle."""
 
+    pytorch_memory_profile_steps: int = 0
+    """Number of training steps to record PyTorch CUDA memory history for. Set to 0 to disable."""
+
+    pytorch_memory_profile_dir: str | None = None
+    """Directory for PyTorch CUDA memory profile snapshots. Defaults to a torch_memory_profile directory."""
+
     record_shapes: bool = False
     """Record shapes of tensors in `torch.autograd.profiler.emit_nvtx` for the Nsys profiler."""
 
