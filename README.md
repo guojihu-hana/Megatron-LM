@@ -2,6 +2,22 @@
 
 This repository contains the OctoPipe runtime configuration loader and example schedules used by this Megatron-LM fork. OctoPipe replaces the standard pipeline schedule with a schedule driven by logical stage workloads. It supports multiple logical stages per physical pipeline rank and uses the NVSHMEM P2P communicator for pipeline activation and gradient traffic.
 
+## Quick Start
+
+1. Use the NVIDIA PyTorch container:
+
+```bash
+nvcr.io/nvidia/pytorch:25.12-py3
+```
+
+2. Install Megatron-LM.
+3. Install NVSHMEM.
+4. Run the Nemotron-Nano-v2 9B example (require 4 H800 GPU):
+
+```bash
+bash Megatron-LM/octopipe/nemotron-nano-v2/9B/run.sh
+```
+
 ## What OctoPipe Adds
 
 OctoPipe introduces three concepts on top of normal pipeline parallelism:
