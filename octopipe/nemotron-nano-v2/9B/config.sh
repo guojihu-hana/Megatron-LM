@@ -1,5 +1,5 @@
 #!/bin/bash
-JOB=NEMOTRONH
+JOB=NEMOTRON_NANO_V2
 LOG_DIR_NAME="${JOB}"
 
 EP_SIZE=1
@@ -22,7 +22,7 @@ RECOMP_LAYER=1
 PP_MODE="octopipe"
 OCTOPIPE_BWD_SPLITTING=True
 OCTOPIPE_CONFIG_DIR="debug_config/nemotron"
-OCTOPIPE_CONFIG_YAML="octopipe/nemotronh/4B/octopipe_config.yaml"
+OCTOPIPE_CONFIG_YAML="octopipe/nemotron-nano-v2/9B/octopipe_config.yaml"
 
 
 PP_LAYOUT="E,t*4|t*4|t*4|t*4|t*4|t*4|t*4|t*4,L" 

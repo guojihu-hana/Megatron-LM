@@ -1,35 +1,31 @@
 MODEL_ARGS=(
     --save-interval 100000
-    --micro-batch-size 1
     --bf16
     --no-masked-softmax-fusion
     --disable-bias-linear
     --untie-embeddings-and-output-weights
     --use-rotary-position-embeddings
     --no-rope-fusion
-    --no-position-embedding
     --normalization RMSNorm
     --squared-relu
-    --num-layers 52
-    --hidden-size 3072
-    --ffn-hidden-size 12288
-    --num-attention-heads 32
+    --num-layers 56
+    --hidden-size 4480
+    --ffn-hidden-size 15680
+    --num-attention-heads 40
+    --kv-channels 128
     --group-query-attention
     --num-query-groups 8
-    --hybrid-override-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-
-    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+    --hybrid-override-pattern M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-
     --is-hybrid-model
-    --mamba-head-dim 64
-    --mamba-num-heads 112
+    --mamba-head-dim 80
+    --mamba-num-heads 128
     --mamba-num-groups 8
     --mamba-state-dim 128
-    --seq-length 4096
-    --max-position-embeddings 8192
+    --max-position-embeddings 131072
     --tokenizer-type NullTokenizer
     --make-vocab-size-divisible-by 128
     --use-mcore-models
-    --rotary-percent 0.5
-    --rotary-base 500000
     --export-model-type MambaModel
     --vocab-size 131072
+    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
 )

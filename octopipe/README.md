@@ -1,6 +1,6 @@
 # OctoPipe
 
-This directory contains the OctoPipe runtime configuration loader and example schedules used by this Megatron-LM fork. OctoPipe replaces the standard pipeline schedule with a schedule driven by logical stage workloads. It supports multiple logical stages per physical pipeline rank and can optionally use the NVSHMEM P2P communicator for pipeline activation and gradient traffic.
+This directory contains the OctoPipe runtime configuration loader and example schedules used by this Megatron-LM fork. OctoPipe replaces the standard pipeline schedule with a schedule driven by logical stage workloads. It supports multiple logical stages per physical pipeline rank and uses the NVSHMEM P2P communicator for pipeline activation and gradient traffic.
 
 ## What OctoPipe Adds
 
@@ -16,7 +16,7 @@ The training code uses the OctoPipe config to:
 - select the model chunk for each local logical stage;
 - choose the OctoPipe forward-backward schedule when `--octopipe` is enabled;
 - optionally split TransformerEngine backward into `b` and `w` workloads with `--octopipe-bwd-splitting`;
-- use NVSHMEM P2P by default unless `OCTOPIPE_NVSHMEM_P2P=0`.
+- use the NVSHMEM P2P communicator by default for pipeline traffic.
 
 ## Code Layout
 
@@ -25,6 +25,7 @@ octopipe/
   generate_inst.py                 # Parses and builds runtime OctoPipe config
   debug_config/*/                  # Legacy partition/placement/result examples
   nemotronh/4B/octopipe_config.yaml # YAML example
+  nemotron-nano-v2/9B/             # Nemotron-Nano-v2 9B example scripts and config
 
 megatron/core/pipeline_parallel/schedules.py
   forward_backward_pipelining_of_octopipe()
@@ -65,12 +66,19 @@ result.txt
 
 `--octopipe-config-yaml` may be absolute, relative to the current working directory, relative to the Megatron-LM source root, or relative to the outer workspace root.
 
-Example from the workspace-level script `../../sh/nemotron-nano-v2/9B/config.sh`:
+The Nemotron-Nano-v2 9B example is available under:
+
+```bash
+cd octopipe/nemotron-nano-v2/9B
+bash run.sh
+```
+
+Example from `octopipe/nemotron-nano-v2/9B/config.sh`:
 
 ```bash
 PP_MODE="octopipe"
 OCTOPIPE_BWD_SPLITTING=True
-OCTOPIPE_CONFIG_YAML="sh/nemotron-nano-v2/9B/octopipe_config.yaml"
+OCTOPIPE_CONFIG_YAML="octopipe/nemotron-nano-v2/9B/octopipe_config.yaml"
 
 configs+=(--octopipe)
 configs+=(--octopipe-bwd-splitting)
@@ -159,9 +167,7 @@ The training path gets this config through `megatron.training.global_vars.get_oc
 When pipeline parallel size is greater than 1:
 
 - `--octopipe` selects the OctoPipe schedule.
-- `OCTOPIPE_NVSHMEM_P2P=1` selects `forward_backward_pipelining_of_octopipe_nvshmem()`. This is the default when the variable is unset.
-- `OCTOPIPE_NVSHMEM_P2P=0` selects the NCCL-based OctoPipe path.
-- otherwise it selects `forward_backward_pipelining_of_octopipe()`.
+- the default execution path is `forward_backward_pipelining_of_octopipe_nvshmem()`.
 
 The NVSHMEM path is comp-driven: it parses send/recv relationships from the workload list, but the main loop executes only compute workloads. It receives the required tensor immediately before compute and sends the produced tensor immediately after compute.
 
@@ -180,18 +186,12 @@ Requirements and behavior:
 - The schedule must contain `w` workloads.
 - `b` workloads compute dgrad, while `w` workloads execute delayed TransformerEngine weight-gradient computation.
 
-## NVSHMEM P2P Mode
+## NVSHMEM P2P Runtime
 
-NVSHMEM P2P is enabled by default. To make the setting explicit:
+OctoPipe uses NVSHMEM P2P by default:
 
 ```bash
 export OCTOPIPE_NVSHMEM_P2P=1
-```
-
-Disable it with:
-
-```bash
-export OCTOPIPE_NVSHMEM_P2P=0
 ```
 
 Useful environment variables:
@@ -266,7 +266,7 @@ Common failures:
 2. Add `--octopipe`.
 3. Add exactly one config source: `--octopipe-config-yaml` or `--octopipe-config-dir`.
 4. If the schedule contains `w` workloads, add `--octopipe-bwd-splitting` and use TransformerEngine.
-5. NVSHMEM P2P is default; export `OCTOPIPE_NVSHMEM_P2P=0` only if you want the NCCL path.
+5. Use the default NVSHMEM P2P path.
 6. For multi-node NVSHMEM P2P, make sure `NVSHMEM_REMOTE_TRANSPORT` is not `none`.
 7. Confirm `placement` uses pipeline group rank ids.
 
@@ -275,6 +275,8 @@ Common failures:
 - `octopipe/generate_inst.py`
 - `octopipe/debug_config/`
 - `octopipe/nemotronh/4B/octopipe_config.yaml`
+- `octopipe/nemotron-nano-v2/9B/run.sh`
+- `octopipe/nemotron-nano-v2/9B/octopipe_config.yaml`
 - `megatron/core/pipeline_parallel/schedules.py`
 - `megatron/core/pipeline_parallel/p2p_communication.py`
 - `../../OctoPipeNvshmemCommunicator.md`
