@@ -1016,6 +1016,7 @@ class NvshmemP2PCommunicator:
         self._data_slots = None
         self._send_buffer = None
         self._ready_flags = None
+        self._release_flags = None
         self._meta = None
         self._meta_src_pe = None
         self._meta_sender_sid = None
@@ -1038,6 +1039,7 @@ class NvshmemP2PCommunicator:
         self._recv_fwd_seq = {}
         self._recv_bwd_seq = {}
         self._send_peer_seq = {}
+        self._send_slot_pending_ack = {}
         self._recv_peer_seq = {}
         self._local_peer_queues = {}
         self._pending_peer_payloads = {}
@@ -1056,6 +1058,7 @@ class NvshmemP2PCommunicator:
         self._trace_max = int(os.environ.get("OCTOPIPE_NVSHMEM_TRACE_MAX", "-1"))
         self._trace_count = 0
         self._quiet_after_send = os.environ.get("OCTOPIPE_NVSHMEM_P2P_QUIET_AFTER_SEND", "0") == "1"
+        self._use_release_ack = os.environ.get("OCTOPIPE_NVSHMEM_P2P_RELEASE_ACK", "1") == "1"
         self._validate_expected_meta = (
             os.environ.get("OCTOPIPE_NVSHMEM_VALIDATE_EXPECTED_META", "0") == "1"
         )
@@ -1133,6 +1136,7 @@ class NvshmemP2PCommunicator:
         self._data_slots = [self._nv.tensor((self._slot_bytes,), dtype=torch.uint8) for _ in range(self._total_slots)]
         self._send_buffer = self._nv.tensor((self._slot_bytes,), dtype=torch.uint8)
         self._ready_flags = [self._nv.tensor((1,), dtype=torch.int64) for _ in range(self._total_slots)]
+        self._release_flags = [self._nv.tensor((1,), dtype=torch.int64) for _ in range(self._total_slots)]
         self._meta = [self._nv.tensor((6,), dtype=torch.int64) for _ in range(self._total_slots)]
         # Backward-compatible aliases for helper code and targeted debugging.
         self._meta_src_pe = [m[0:1] for m in self._meta]
@@ -1153,6 +1157,7 @@ class NvshmemP2PCommunicator:
             for slot in range(self._total_slots):
                 self._data_slots[slot].zero_()
                 self._ready_flags[slot].zero_()
+                self._release_flags[slot].zero_()
                 self._meta[slot][0].zero_()
                 self._meta[slot][1].fill_(-1)
                 self._meta[slot][2].fill_(-1)
@@ -1212,16 +1217,60 @@ class NvshmemP2PCommunicator:
         src_pe = self._rank if src_group_rank is None else int(src_group_rank)
         return src_pe * self._peer_slots + self._peer_slot(route_key, seq)
 
-    def _wait_remote_slot_empty(self, dst_group_rank: int, slot: int):
+    def _send_release_ack_slot(self, dst_group_rank: int, slot: int) -> int:
+        return int(dst_group_rank) * self._peer_slots + (int(slot) % self._peer_slots)
+
+    def _wait_send_slot_available(
+        self, dst_group_rank: int, slot: int, ready_tag: int, route_key=None, seq: int = None
+    ):
+        """Wait until this sender can reuse ``slot`` on ``dst_group_rank``."""
+        if not self._use_release_ack:
+            self._wait_remote_slot_empty(dst_group_rank, slot, route_key=route_key, seq=seq)
+            return
+
+        local_slot = int(slot) % self._peer_slots
+        key = (int(dst_group_rank), local_slot)
+        ack_slot = self._send_release_ack_slot(dst_group_rank, slot)
+        pending_tag = self._send_slot_pending_ack.get(key)
+        if pending_tag is not None:
+            self._trace_event(
+                f"send-wait-release src={self._rank} dst={dst_group_rank} route={route_key} "
+                f"seq={seq} slot={slot} ack_slot={ack_slot} tag={pending_tag}"
+            )
+            self._call_nvshmem_wait_until(self._release_flags[ack_slot], int(pending_tag), exact=True)
+            with torch.no_grad():
+                self._release_flags[ack_slot].zero_()
+        self._send_slot_pending_ack[key] = int(ready_tag)
+
+    def _wait_remote_slot_empty(self, dst_group_rank: int, slot: int, route_key=None, seq: int = None):
         """Poll the destination PE's ready flag before reusing its staging slot."""
-        self._nv.get(
-            dst=self._tmp_ready,
-            src=self._ready_flags[slot],
-            remote_pe=dst_group_rank,
-            stream=self._stream,
-        )
-        self._nv.quiet(stream=self._stream)
-        self._call_nvshmem_wait_until(self._tmp_ready, 0, exact=True)
+        spins = 0
+        last_ready = None
+        while True:
+            self._nv.get(
+                dst=self._tmp_ready,
+                src=self._ready_flags[slot],
+                remote_pe=dst_group_rank,
+                stream=self._stream,
+            )
+            self._nv.quiet(stream=self._stream)
+            ready = int(self._tmp_ready[0].item())
+            if ready == 0:
+                if spins:
+                    self._trace_event(
+                        f"send-slot-free src={self._rank} dst={dst_group_rank} route={route_key} "
+                        f"seq={seq} slot={slot} spins={spins}"
+                    )
+                return
+            if spins == 0 or ready != last_ready:
+                self._trace_event(
+                    f"send-wait-slot src={self._rank} dst={dst_group_rank} route={route_key} "
+                    f"seq={seq} slot={slot} ready={ready}"
+                )
+                last_ready = ready
+            spins += 1
+            if spins % 1024 == 0:
+                time.sleep(0.001)
 
     def _write_remote_slot_meta(self, slot: int, dst_group_rank: int, route_key, seq: int, num_bytes: int):
         sender_sid, recver_sid, mid = route_key
@@ -1288,6 +1337,7 @@ class NvshmemP2PCommunicator:
                 f"seq={meta['seq']} slot={slot}"
             )
         self._release_slot(slot)
+        self._signal_remote_slot_release(slot, meta["src_pe"], route_key, meta["seq"])
 
     def _drain_ready_slots(self, src_group_rank: int, expected_route=None, expected_seq=None):
         """Move ready but not-yet-consumed staging slots into owned tensors.
@@ -1323,6 +1373,29 @@ class NvshmemP2PCommunicator:
             self._stash_ready_slot(slot, meta)
         return expected_slot
 
+    def _drain_ready_slots_all_sources(
+        self, expected_src_group_rank: int = None, expected_route=None, expected_seq=None
+    ):
+        """Drain ready slots from every source PE, preserving the expected slot."""
+        expected_slot = None
+        for src_group_rank in range(self._world):
+            if src_group_rank == self._rank:
+                continue
+            slot = self._drain_ready_slots(
+                src_group_rank,
+                expected_route=expected_route
+                if expected_src_group_rank is not None
+                and src_group_rank == int(expected_src_group_rank)
+                else None,
+                expected_seq=expected_seq
+                if expected_src_group_rank is not None
+                and src_group_rank == int(expected_src_group_rank)
+                else None,
+            )
+            if src_group_rank == expected_src_group_rank and slot is not None:
+                expected_slot = slot
+        return expected_slot
+
     def _validate_slot_meta(self, slot: int, src_group_rank: int, route_key, expected_seq: int, expected_bytes: int):
         meta = self._read_slot_meta(slot)
         expected = {
@@ -1347,6 +1420,41 @@ class NvshmemP2PCommunicator:
             self._meta[slot][1].fill_(-1)
             self._meta[slot][2].fill_(-1)
             self._meta[slot][3].fill_(-1)
+
+    def _signal_op_on_stream(self, signal_addr: torch.Tensor, signal_value: int, remote_pe: int) -> bool:
+        signal_op = getattr(self._nv_bindings, "signal_op_on_stream", None)
+        if signal_op is None:
+            signal_op = getattr(self._nv_bindings, "nvshmemx_signal_op_on_stream", None)
+        if signal_op is None or self._nv_signal_set is None:
+            return False
+        signal_op(
+            signal_addr.data_ptr(),
+            int(signal_value),
+            int(self._nv_signal_set),
+            int(remote_pe),
+            self._stream_handle(),
+        )
+        return True
+
+    def _signal_remote_slot_release(self, slot: int, src_group_rank: int, route_key, seq: int):
+        if not self._use_release_ack:
+            return
+        ack_slot = self._send_release_ack_slot(self._rank, slot)
+        ack_tag = self._ready_tag(route_key, seq)
+        ack_addr = self._release_flags[ack_slot]
+        if not self._signal_op_on_stream(ack_addr, ack_tag, src_group_rank):
+            with torch.no_grad():
+                self._tmp_ready.fill_(ack_tag)
+            self._nv.put(
+                dst=ack_addr,
+                src=self._tmp_ready,
+                remote_pe=src_group_rank,
+                stream=self._stream,
+            )
+        self._trace_event(
+            f"release-ack src={src_group_rank} dst={self._rank} route={route_key} "
+            f"seq={seq} slot={slot} ack_slot={ack_slot} tag={ack_tag}"
+        )
 
     def _infer_p2p_slot_bytes_from_config(self):
         micro_batch_size = getattr(self.config, "micro_batch_size", None)
@@ -1762,14 +1870,17 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
         seq_key = (self._rank, dst_group_rank, route_key)
         seq = self._send_peer_seq.get(seq_key, 0) + 1
         slot = self._slot_for_route(route_key, seq, src_group_rank=self._rank)
+        ready_tag = self._ready_tag(route_key, seq)
         self._trace_event(
             f"send src={self._rank} dst={dst_group_rank} route={route_key} seq={seq} slot={slot} bytes={num_bytes}"
         )
         self._send_peer_seq[seq_key] = seq
 
         # Do not overwrite a remote staging slot until the receiver has copied
-        # the previous payload out and cleared the ready flag.
-        self._wait_remote_slot_empty(dst_group_rank, slot)
+        # the previous payload out and acknowledged the slot release.
+        self._wait_send_slot_available(
+            dst_group_rank, slot, ready_tag, route_key=route_key, seq=seq
+        )
 
         dst_data = self._slot_slice(slot, num_bytes)
         if not self._putmem_on_stream(dst_data, t, num_bytes, dst_group_rank):
@@ -1785,7 +1896,6 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
             self._tmp_meta[3].fill_(int(mid))
             self._tmp_meta[4].fill_(int(seq))
             self._tmp_meta[5].fill_(int(num_bytes))
-            ready_tag = self._ready_tag(route_key, seq)
         if not self._putmem_signal_on_stream(
             self._meta[slot],
             self._tmp_meta,
@@ -1839,8 +1949,10 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
                 f"{self._slot_bytes} bytes. Configure OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES for this run."
             )
 
-        slot = self._drain_ready_slots(
-            src_group_rank, expected_route=route_key, expected_seq=expected
+        slot = self._drain_ready_slots_all_sources(
+            expected_src_group_rank=src_group_rank,
+            expected_route=route_key,
+            expected_seq=expected,
         )
         if slot is None:
             slot = self._slot_for_route(route_key, expected, src_group_rank=src_group_rank)
@@ -1862,6 +1974,7 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
         with torch.no_grad():
             out.view(torch.uint8).reshape(-1).copy_(local, non_blocking=True)
             self._release_slot(slot)
+        self._signal_remote_slot_release(slot, src_group_rank, route_key, expected)
 
     def _recv_peer_tensor(
         self,
@@ -2153,18 +2266,25 @@ class OctoPipeP2PCommunicator(NvshmemP2PCommunicator):
                 expected_tag = self._ready_tag(route_key, expected)
                 continue
 
-            slot = self._slot_for_route(route_key, expected, src_group_rank=src_group_rank)
-            ready = int(self._ready_flags[slot][0].item())
-            if ready != expected_tag:
-                return None
-
             expected_bytes = self._shape_nbytes(s)
+            slot = self._drain_ready_slots_all_sources(
+                expected_src_group_rank=src_group_rank,
+                expected_route=route_key,
+                expected_seq=expected,
+            )
+            if slot is None:
+                slot = self._slot_for_route(route_key, expected, src_group_rank=src_group_rank)
+                ready = int(self._ready_flags[slot][0].item())
+                if ready != expected_tag:
+                    return None
+
             if self._validate_expected_meta:
                 self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
             local = self._slot_slice(slot, expected_bytes)
             with torch.no_grad():
                 out.view(torch.uint8).reshape(-1).copy_(local, non_blocking=True)
                 self._release_slot(slot)
+            self._signal_remote_slot_release(slot, src_group_rank, route_key, expected)
             self._recv_peer_seq[expected_key] = expected
             outs.append(out)
             expected += 1
