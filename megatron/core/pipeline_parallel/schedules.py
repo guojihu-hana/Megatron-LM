@@ -515,6 +515,7 @@ def forward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     vp_stage=None,
+    is_first_stage=None,
     is_last_stage=True,
 ):
     """Forward step for passed-in model.
@@ -614,20 +615,30 @@ def forward_step(
     with context_manager:
         if checkpoint_activations_microbatch is None:
             _fsig = inspect.signature(forward_step_func)
+            forward_kwargs = {}
+            if is_first_stage is not None and "is_first_stage" in _fsig.parameters:
+                forward_kwargs["is_first_stage"] = is_first_stage
             if "is_last_stage" in _fsig.parameters:
+                forward_kwargs["is_last_stage"] = is_last_stage
+            if forward_kwargs:
                 output_tensor, loss_func = forward_step_func(
-                    data_iterator, model, is_last_stage=is_last_stage
+                    data_iterator, model, **forward_kwargs
                 )
             else:
                 output_tensor, loss_func = forward_step_func(data_iterator, model)
         else:
             _fsig = inspect.signature(forward_step_func)
+            forward_kwargs = {}
+            if is_first_stage is not None and "is_first_stage" in _fsig.parameters:
+                forward_kwargs["is_first_stage"] = is_first_stage
             if "is_last_stage" in _fsig.parameters:
+                forward_kwargs["is_last_stage"] = is_last_stage
+            if forward_kwargs:
                 output_tensor, loss_func = forward_step_func(
                     data_iterator,
                     model,
                     checkpoint_activations_microbatch,
-                    is_last_stage=is_last_stage,
+                    **forward_kwargs,
                 )
             else:
                 output_tensor, loss_func = forward_step_func(
@@ -745,11 +756,35 @@ def _register_octopipe_wgrad_task(model_chunk, chunk=0, tag=None):
 
     def run_backward_dw():
         for module in reversed(backward_dw_modules):
-            module.backward_dw()
+            _call_octopipe_backward_dw(module)
 
     description = ",".join(type(module).__name__ for module in backward_dw_modules)
+    if os.environ.get("OCTOPIPE_TRACE_MEMORY", "0") == "1":
+        try:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        except RuntimeError:
+            rank = -1
+        print(
+            f"[octopipe-wgrad-modules][rank={rank}] chunk={chunk} tag={tag} "
+            f"modules={description}",
+            flush=True,
+        )
     WeightGradStore.put_task(run_backward_dw, description=description, chunk=chunk, tag=tag)
     WeightGradStore.flush(chunk=chunk, tag=tag)
+
+
+def _call_octopipe_backward_dw(module):
+    """Run a delayed wgrad callable with OctoPipe-specific MoE defaults."""
+    backward_dw = getattr(module, "backward_dw")
+    if getattr(module, "use_shared_expert", False):
+        try:
+            backward_dw_parameters = inspect.signature(backward_dw).parameters
+        except (TypeError, ValueError):
+            backward_dw_parameters = {}
+        if "shared_experts" in backward_dw_parameters:
+            backward_dw(routed_experts=True, shared_experts=True)
+            return
+    backward_dw()
 
 
 def _collect_octopipe_backward_dw_modules(model_chunk):
@@ -860,6 +895,7 @@ def _octopipe_f_comp(
     checkpoint_activations_microbatch,
     is_first_microbatch: bool,
     current_microbatch: int,
+    is_first_stage: bool,
     is_last_stage: bool,
     profiler,
     sid: int,
@@ -881,6 +917,7 @@ def _octopipe_f_comp(
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=is_first_microbatch,
             current_microbatch=current_microbatch,
+            is_first_stage=is_first_stage,
             is_last_stage=is_last_stage,
         )
     return profiler.call(
@@ -900,6 +937,7 @@ def _octopipe_f_comp(
         checkpoint_activations_microbatch=checkpoint_activations_microbatch,
         is_first_microbatch=is_first_microbatch,
         current_microbatch=current_microbatch,
+        is_first_stage=is_first_stage,
         is_last_stage=is_last_stage,
     )
 
@@ -3062,6 +3100,7 @@ def forward_backward_pipelining_of_octopipe(
                     checkpoint_activations_microbatch=None, # NOTE: not supported logic
                     is_first_microbatch=check_first_val_step(first_val_step, forward_only, mid == 0),
                     current_microbatch=mid,
+                    is_first_stage=sid == first_stage_sid,
                     is_last_stage= sid == last_stage_sid,
                 )
                 total_num_tokens += num_tokens
@@ -3436,6 +3475,68 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
     octopipe_bwd_splitting = (
         _prepare_octopipe_bwd_splitting(config, workloads) if not forward_only else False
     )
+    trace_memory = os.environ.get("OCTOPIPE_TRACE_MEMORY", "0") == "1"
+
+    def _trace_memory(where: str, workload=None):
+        if not trace_memory:
+            return
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() / (1024 * 1024)
+        reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+        max_allocated = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        max_reserved = torch.cuda.max_memory_reserved() / (1024 * 1024)
+        pending = []
+        if WeightGradStore.weight_grad_queue is not None:
+            for chunk in range(len(model)):
+                count = WeightGradStore.pending_count(chunk=chunk)
+                if count:
+                    pending.append(f"{chunk}:{count}")
+        pending_text = ",".join(pending) if pending else "-"
+        print(
+            f"[octopipe-memory][rank={torch.distributed.get_rank()} pp_rank={pp_rank}] "
+            f"{where} workload={workload} allocated={allocated:.2f}MB "
+            f"reserved={reserved:.2f}MB max_allocated={max_allocated:.2f}MB "
+            f"max_reserved={max_reserved:.2f}MB pending_wgrad={pending_text}",
+            flush=True,
+        )
+
+    def _trace_grad_memory(where: str):
+        if not trace_memory:
+            return
+        torch.cuda.synchronize()
+        grad_bytes = 0
+        grad_count = 0
+        delayed_grad_bytes = 0
+        delayed_grad_count = 0
+        not_added_count = 0
+        samples = []
+        for chunk_idx, model_chunk in enumerate(model):
+            named_parameters = get_attr_wrapped_model(model_chunk, "named_parameters")()
+            for name, param in named_parameters:
+                if getattr(param, "grad", None) is None:
+                    continue
+                bytes_ = param.grad.numel() * param.grad.element_size()
+                grad_bytes += bytes_
+                grad_count += 1
+                if getattr(param, "skip_backward_post_hook", False):
+                    delayed_grad_bytes += bytes_
+                    delayed_grad_count += 1
+                if hasattr(param, "grad_added_to_main_grad") and not param.grad_added_to_main_grad:
+                    not_added_count += 1
+                if len(samples) < 6:
+                    samples.append(
+                        f"chunk{chunk_idx}:{name}:{bytes_ / (1024 * 1024):.1f}MB:"
+                        f"skip={int(getattr(param, 'skip_backward_post_hook', False))}:"
+                        f"added={getattr(param, 'grad_added_to_main_grad', 'na')}"
+                    )
+        print(
+            f"[octopipe-grad-memory][rank={torch.distributed.get_rank()} pp_rank={pp_rank}] "
+            f"{where} grad_count={grad_count} grad_mb={grad_bytes / (1024 * 1024):.2f} "
+            f"delayed_grad_count={delayed_grad_count} "
+            f"delayed_grad_mb={delayed_grad_bytes / (1024 * 1024):.2f} "
+            f"not_added_count={not_added_count} samples={';'.join(samples) if samples else '-'}",
+            flush=True,
+        )
 
     def _recv_for_comp(mid, src_sid, dst_sid, tensor_shapes, requires_grad):
         return p2p_communicator.recv_tensor_blocking(
@@ -3460,6 +3561,7 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
         deallocate_output_tensor(tensor, config.deallocate_pipeline_outputs)
 
     for workload in comp_workloads:
+        _trace_memory("before", workload)
         wtype = workload['type']
         mid = workload['mid']
         sid = workload['sid']
@@ -3492,6 +3594,7 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, mid == 0),
                 current_microbatch=mid,
+                is_first_stage=sid == first_stage_sid,
                 is_last_stage=sid == last_stage_sid,
                 profiler=stage_time_profiler,
                 sid=sid,
@@ -3557,6 +3660,9 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
             )
         else:
             raise ValueError(f"comp Workload Type Error: {wtype}")
+        _trace_memory("after", workload)
+        if wtype == 'w':
+            _trace_grad_memory(f"after-w sid={sid} mid={mid}")
 
     if octopipe_bwd_splitting:
         pending_chunks = [
@@ -3583,6 +3689,7 @@ def forward_backward_pipelining_of_octopipe_nvshmem(
             pg_collection=pg_collection,
             force_all_reduce=force_all_reduce,
         )
+        _trace_grad_memory("after-finalize")
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

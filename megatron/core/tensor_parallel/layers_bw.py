@@ -557,7 +557,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 _total_input_ = _input_
                 return _total_input_, None
 
-        not_split_bw = not WeightGradStore.split_bw or not WeightGradStore.is_supported()
+        not_split_bw = not WeightGradStore.split_bw() or not WeightGradStore.is_supported()
         if not_split_bw:
             pre_processed_results = pre_process(input)
 

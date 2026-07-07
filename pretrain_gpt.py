@@ -96,7 +96,12 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+def get_batch(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    is_first_stage: Optional[bool] = None,
+    is_last_stage: Optional[bool] = None,
+):
     """Generate a batch."""
 
     args = get_args()
@@ -114,7 +119,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     )
     is_hybrid_cp = args.hybrid_context_parallel
 
-    if args.octopipe:
+    stage_override = is_first_stage is not None or is_last_stage is not None
+    if is_first_stage is None:
+        is_first_stage = mpu.is_pipeline_first_stage()
+    if is_last_stage is None:
+        is_last_stage = mpu.is_pipeline_last_stage()
+
+    if args.octopipe and stage_override:
+        on_active_stage = is_first_stage or is_last_stage
+    elif args.octopipe:
         on_active_stage = is_octopipe_first_or_last_pipeline_stage(vp_stage)
     else:
         on_active_stage = is_first_or_last_pipeline_stage(vp_stage)
@@ -145,8 +158,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         seq_length=args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
-        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        is_pipeline_first_stage=is_first_stage,
+        is_pipeline_last_stage=is_last_stage,
     )
 
     if not on_active_stage and not mtp_on_this_rank:
@@ -282,6 +295,7 @@ def forward_step(
     data_iterator,
     model: GPTModel,
     return_schedule_plan: bool = False,
+    is_first_stage: Optional[bool] = None,
     is_last_stage: bool = True,
 ):
     """Forward training step.
@@ -312,7 +326,12 @@ def forward_step(
             max_seqlen,
             position_ids,
             tokens,
-        ) = get_batch(data_iterator, vp_stage)
+        ) = get_batch(
+            data_iterator,
+            vp_stage,
+            is_first_stage=is_first_stage,
+            is_last_stage=is_last_stage,
+        )
         labels, loss_mask = broadcast_labels_loss_mask_for_tp_if_needed(
             labels, loss_mask, is_last_stage
         )
