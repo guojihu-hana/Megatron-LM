@@ -4,37 +4,28 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 WORKSPACE_ROOT=$(cd "$REPO_ROOT/.." && pwd)
 
 export WORKSPACE_ROOT
+
+TIME=$(date +"%Y-%m-%d-%H%M-%S")
+echo "Time now: $TIME"
+
+NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [ -z "$NUM_GPUS" ] || [ "$NUM_GPUS" -eq 0 ]; then
+    echo "WARNING: no GPU detected, defaulting to 1"
+    NUM_GPUS=1
+fi
+
 export MASTER_ADDR=${MASTER_ADDR:-localhost}
-export GPUS_PER_NODE=${PROC_PER_NODE:-${GPUS_PER_NODE:-$(nvidia-smi -L 2>/dev/null | wc -l)}}
+export GPUS_PER_NODE=${PROC_PER_NODE:-${GPUS_PER_NODE:-$NUM_GPUS}}
 export MASTER_PORT=${MASTER_PORT:-6001}
 export NNODES=${NODE_COUNT:-${NNODES:-1}}
 export NODE_RANK=${NODE_RANK:-0}
 export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
-export PP_MODE=$PP_MODE
+export PP_MODE=${PP_MODE:-octopipe}
 export OCTOPIPE_NVSHMEM_P2P=1
 export NVSHMEM_REMOTE_TRANSPORT=${NVSHMEM_REMOTE_TRANSPORT:-none}
 export ENABLE_OCTOPIPE_PROFILER=${ENABLE_OCTOPIPE_PROFILER:-0}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-
-if [ -n "$TIME" ]; then
-    echo "Time set to: $TIME"
-else
-    TIME=$(date +"%Y-%m-%d-%H%M-%S")
-    echo "Time now: $TIME"
-    NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
-    if [ -z "$NUM_GPUS" ] || [ "$NUM_GPUS" -eq 0 ]; then
-        echo "WARNING: no GPU detected, defaulting to 1"
-        NUM_GPUS=1
-    fi
-    export MASTER_ADDR=${MASTER_ADDR:-localhost}
-    export GPUS_PER_NODE=$NUM_GPUS
-    export MASTER_PORT=6001
-    export NNODES=1
-    export NODE_RANK=0
-    export WORLD_SIZE=$NUM_GPUS
-    export PP_MODE=$PP_MODE
-    echo "Using $NUM_GPUS GPU(s), WORLD_SIZE=$WORLD_SIZE"
-fi
+echo "Using $GPUS_PER_NODE GPU(s) per node, WORLD_SIZE=$WORLD_SIZE"
 
 set -ex
 
