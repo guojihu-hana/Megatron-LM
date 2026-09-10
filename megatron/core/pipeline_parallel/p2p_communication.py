@@ -2,8 +2,10 @@
 
 import logging
 import os
+import socket
 import sys
 import time
+from contextlib import contextmanager
 from importlib import import_module
 from typing import List, Optional, Tuple, Union
 
@@ -1051,6 +1053,11 @@ class NvshmemP2PCommunicator:
         self._pending_overflow_warned = False
         self._route_slots = {}
         self._route_slot_counts = {}
+        self._busy_slots = {}
+        # Slots a stream-side recv wait has been enqueued for; drains must not
+        # steal these or the wait never satisfies.
+        self._claimed_slots = set()
+        self._slot_stream_pool = {}
         self._registered_workloads_id = None
         # Fixed-size NVSHMEM staging slots for routed OctoPipe peer traffic.
         self._peer_slots = int(os.environ.get("OCTOPIPE_NVSHMEM_P2P_NUM_SLOTS", "8"))
@@ -1059,6 +1066,20 @@ class NvshmemP2PCommunicator:
         self._trace_count = 0
         self._quiet_after_send = os.environ.get("OCTOPIPE_NVSHMEM_P2P_QUIET_AFTER_SEND", "0") == "1"
         self._use_release_ack = os.environ.get("OCTOPIPE_NVSHMEM_P2P_RELEASE_ACK", "1") == "1"
+        # Host-side progress engine for the send-slot-ack wait.  Stream-side
+        # waits (signal_wait_until_on_stream) deadlock deep mb>=2*pp
+        # schedules: a rank blocked on a send-slot ack stops draining its own
+        # inbound slots, so the peer waiting on those releases never acks --
+        # a cross-rank cycle.  Every such cycle contains at least one
+        # send-ack edge (recv waits alone cannot cycle: if no sender is
+        # blocked, every send completes and every recv is eventually
+        # satisfied), so host-polling + inbound draining on the send wait
+        # alone restores liveness while recvs keep the cheap stream wait.
+        # Set to 0 to restore the original stream wait on sends too.
+        self._progress_wait = os.environ.get("OCTOPIPE_NVSHMEM_PROGRESS_WAIT", "1") == "1"
+        # Optional host-polling recv wait (debugging aid); serializes the
+        # recv path on the host and is markedly slower -- keep off.
+        self._progress_recv = os.environ.get("OCTOPIPE_NVSHMEM_PROGRESS_RECV", "0") == "1"
         self._validate_expected_meta = (
             os.environ.get("OCTOPIPE_NVSHMEM_VALIDATE_EXPECTED_META", "0") == "1"
         )
@@ -1094,6 +1115,33 @@ class NvshmemP2PCommunicator:
         dev = Device(local_rank)
         dev.set_current()
         self._stream = nvshmem_core.NvshmemStream(torch.cuda.current_stream())
+        # Split communication streams.  With everything on the compute
+        # stream, a stream-side recv wait blocks every later send enqueued on
+        # the same stream (head-of-line), and deep interleaved schedules
+        # (mb >= 2*pp on large models) form cross-rank wait cycles.  Routing
+        # sends and recvs through dedicated streams (ordered against compute
+        # via events) leaves only true data dependencies, which a valid
+        # schedule keeps acyclic.  OCTOPIPE_NVSHMEM_SPLIT_STREAMS=0 restores
+        # the single-stream behaviour.
+        self._split_streams = os.environ.get("OCTOPIPE_NVSHMEM_SPLIT_STREAMS", "1") == "1"
+        self._active_nv_stream = self._stream
+        self._active_torch_stream = None
+        if self._split_streams:
+            self._send_torch_stream = torch.cuda.Stream()
+            self._recv_torch_stream = torch.cuda.Stream()
+            # Drain consumption must never queue behind a blocked recv wait,
+            # so it gets its own stream that only carries copies/releases.
+            self._drain_torch_stream = torch.cuda.Stream()
+            self._send_nv_stream = nvshmem_core.NvshmemStream(self._send_torch_stream)
+            self._recv_nv_stream = nvshmem_core.NvshmemStream(self._recv_torch_stream)
+            self._drain_nv_stream = nvshmem_core.NvshmemStream(self._drain_torch_stream)
+        else:
+            self._send_torch_stream = None
+            self._recv_torch_stream = None
+            self._drain_torch_stream = None
+            self._send_nv_stream = None
+            self._recv_nv_stream = None
+            self._drain_nv_stream = None
 
         uid = nvshmem_core.get_unique_id(empty=self._rank != 0)
         objs = [None] * self._world
@@ -1105,6 +1153,25 @@ class NvshmemP2PCommunicator:
             nranks=self._world,
             initializer_method="uid",
         )
+        # Direct putmem from an arbitrary local tensor only works over
+        # intra-node P2P/IPC mappings. Over the IB proxy path (multi-node),
+        # the source must live in registered (symmetric) memory, otherwise
+        # ibv_poll_cq fails with IBV_WC_LOC_PROT_ERR. Stage sends through the
+        # symmetric send buffer whenever the pp_group spans multiple hosts.
+        direct_env = os.environ.get("OCTOPIPE_NVSHMEM_P2P_DIRECT_PUT")
+        if direct_env is not None:
+            self._direct_put_ok = direct_env == "1"
+        else:
+            hosts = [None] * self._world
+            torch.distributed.all_gather_object(
+                hosts, socket.gethostname(), group=self.pp_group
+            )
+            self._direct_put_ok = len(set(hosts)) <= 1
+        if self._rank == 0 and not self._direct_put_ok:
+            logger.info(
+                "NVSHMEM P2P: multi-host pp_group detected; staging sends via "
+                "the symmetric send buffer."
+            )
         self._nv = nvshmem_core
         self._nv_bindings = nvshmem_bindings
         self._nv_cmp_eq = nvshmem_bindings.Cmp_type.CMP_EQ
@@ -1237,7 +1304,25 @@ class NvshmemP2PCommunicator:
                 f"send-wait-release src={self._rank} dst={dst_group_rank} route={route_key} "
                 f"seq={seq} slot={slot} ack_slot={ack_slot} tag={pending_tag}"
             )
-            self._call_nvshmem_wait_until(self._release_flags[ack_slot], int(pending_tag), exact=True)
+            if self._progress_wait:
+                flag = self._release_flags[ack_slot]
+                spins = 0
+                while int(flag[0].item()) != int(pending_tag):
+                    # Keep consuming inbound traffic while blocked so peers
+                    # waiting on our releases can make progress (deadlock
+                    # avoidance for deep interleaved schedules).
+                    if self._split_streams:
+                        with self._use_stream(self._drain_nv_stream, self._drain_torch_stream):
+                            self._drain_ready_slots_all_sources()
+                    else:
+                        self._drain_ready_slots_all_sources()
+                    spins += 1
+                    if spins % 512 == 0:
+                        time.sleep(0.0005)
+            else:
+                self._call_nvshmem_wait_until(
+                    self._release_flags[ack_slot], int(pending_tag), exact=True
+                )
             with torch.no_grad():
                 self._release_flags[ack_slot].zero_()
         self._send_slot_pending_ack[key] = int(ready_tag)
@@ -1251,9 +1336,9 @@ class NvshmemP2PCommunicator:
                 dst=self._tmp_ready,
                 src=self._ready_flags[slot],
                 remote_pe=dst_group_rank,
-                stream=self._stream,
+                stream=self._nv_stream(),
             )
-            self._nv.quiet(stream=self._stream)
+            self._nv.quiet(stream=self._nv_stream())
             ready = int(self._tmp_ready[0].item())
             if ready == 0:
                 if spins:
@@ -1285,7 +1370,7 @@ class NvshmemP2PCommunicator:
             dst=self._meta[slot],
             src=self._tmp_meta,
             remote_pe=dst_group_rank,
-            stream=self._stream,
+            stream=self._nv_stream(),
         )
 
     def _read_slot_meta(self, slot: int):
@@ -1304,16 +1389,20 @@ class NvshmemP2PCommunicator:
 
     def _try_pop_pending_payload(self, out: torch.Tensor, src_group_rank: int, route_key, seq: int):
         key = self._pending_key(src_group_rank, route_key, seq)
-        payload = self._pending_peer_payloads.pop(key, None)
-        if payload is None:
+        entry = self._pending_peer_payloads.pop(key, None)
+        if entry is None:
             return False
+        payload, ev = entry
         if payload.numel() != self._tensor_nbytes(out):
             raise RuntimeError(
                 f"NVSHMEM pending payload size mismatch on rank {self._rank}: "
                 f"payload={payload.numel()} expected={self._tensor_nbytes(out)} route={route_key}"
             )
+        # The stash copy may have been enqueued on another comm stream.
+        torch.cuda.current_stream().wait_event(ev)
         with torch.no_grad():
             out.view(torch.uint8).reshape(-1).copy_(payload, non_blocking=True)
+        payload.record_stream(torch.cuda.current_stream())
         return True
 
     def _stash_ready_slot(self, slot: int, meta):
@@ -1331,13 +1420,41 @@ class NvshmemP2PCommunicator:
             )
             with torch.no_grad():
                 payload.copy_(self._slot_slice(slot, meta["num_bytes"]), non_blocking=True)
-            self._pending_peer_payloads[key] = payload
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream())
+            self._pending_peer_payloads[key] = (payload, ev)
             self._trace_event(
                 f"stash src={meta['src_pe']} dst={self._rank} route={route_key} "
                 f"seq={meta['seq']} slot={slot}"
             )
         self._release_slot(slot)
         self._signal_remote_slot_release(slot, meta["src_pe"], route_key, meta["seq"])
+        self._mark_slot_busy(slot)
+
+    def _mark_slot_busy(self, slot: int):
+        """Record stream events covering the enqueued consumption of ``slot``.
+
+        Consumption (stream wait + payload copy + flag reset + release signal)
+        is stream-ordered, but drains poll flags from the host.  Until these
+        events complete, the host may observe a stale ready flag or steal a
+        message an already-enqueued stream wait depends on, so drains must
+        skip the slot.
+        """
+        # Local flag resets and payload copies are enqueued on the current
+        # torch stream; the comm stream only carries remote-facing signals,
+        # which drains never read locally.  One event suffices.
+        ev_cur = torch.cuda.Event()
+        ev_cur.record(torch.cuda.current_stream())
+        self._busy_slots[slot] = (ev_cur,)
+
+    def _slot_is_busy(self, slot: int) -> bool:
+        events = self._busy_slots.get(slot)
+        if events is None:
+            return False
+        if all(ev.query() for ev in events):
+            del self._busy_slots[slot]
+            return False
+        return True
 
     def _drain_ready_slots(self, src_group_rank: int, expected_route=None, expected_seq=None):
         """Move ready but not-yet-consumed staging slots into owned tensors.
@@ -1355,6 +1472,8 @@ class NvshmemP2PCommunicator:
             else None
         )
         for slot in range(start, end):
+            if slot in self._claimed_slots or self._slot_is_busy(slot):
+                continue
             ready = int(self._ready_flags[slot][0].item())
             if ready == 0:
                 continue
@@ -1449,7 +1568,7 @@ class NvshmemP2PCommunicator:
                 dst=ack_addr,
                 src=self._tmp_ready,
                 remote_pe=src_group_rank,
-                stream=self._stream,
+                stream=self._nv_stream(),
             )
         self._trace_event(
             f"release-ack src={src_group_rank} dst={self._rank} route={route_key} "
@@ -1795,13 +1914,29 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
         signal_wait = getattr(self._nv_bindings, "signal_wait_until_on_stream", None)
         cmp_op = self._nv_cmp_eq if exact else self._nv_cmp_ge
         if signal_wait is not None and cmp_op is not None:
-            stream = int(self._stream.__cuda_stream__()[1])
-            signal_wait(ready.data_ptr(), int(cmp_op), int(expected), stream)
+            signal_wait(ready.data_ptr(), int(cmp_op), int(expected), self._stream_handle())
             return
         self._get_cuda_wait_until()(ready, int(expected), exact)
 
+    def _nv_stream(self):
+        return self._active_nv_stream
+
     def _stream_handle(self) -> int:
-        return int(self._stream.__cuda_stream__()[1])
+        return int(self._active_nv_stream.__cuda_stream__()[1])
+
+    @contextmanager
+    def _use_stream(self, nv_stream, torch_stream):
+        """Route nvshmem ops and torch enqueues to a dedicated comm stream."""
+        if nv_stream is None:
+            yield
+            return
+        prev = self._active_nv_stream
+        self._active_nv_stream = nv_stream
+        try:
+            with torch.cuda.stream(torch_stream):
+                yield
+        finally:
+            self._active_nv_stream = prev
 
     def _putmem_on_stream(self, dst: torch.Tensor, src: torch.Tensor, num_bytes: int, remote_pe: int) -> bool:
         putmem = getattr(self._nv_bindings, "putmem_on_stream", None)
@@ -1882,11 +2017,28 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
             dst_group_rank, slot, ready_tag, route_key=route_key, seq=seq
         )
 
+        if self._split_streams:
+            # Emit on the dedicated send stream so a blocked recv wait can
+            # never delay this send.  Order after the producer of ``t``.
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream())
+            with self._use_stream(self._send_nv_stream, self._send_torch_stream):
+                self._send_torch_stream.wait_event(ev)
+                t.record_stream(self._send_torch_stream)
+                self._emit_peer_send(t, dst_group_rank, route_key, slot, ready_tag, seq, num_bytes)
+        else:
+            self._emit_peer_send(t, dst_group_rank, route_key, slot, ready_tag, seq, num_bytes)
+
+    def _emit_peer_send(
+        self, t: torch.Tensor, dst_group_rank: int, route_key, slot: int,
+        ready_tag: int, seq: int, num_bytes: int,
+    ):
         dst_data = self._slot_slice(slot, num_bytes)
-        if not self._putmem_on_stream(dst_data, t, num_bytes, dst_group_rank):
+        direct_ok = getattr(self, "_direct_put_ok", True)
+        if not direct_ok or not self._putmem_on_stream(dst_data, t, num_bytes, dst_group_rank):
             send_src = self._send_buffer[:num_bytes]
             send_src.copy_(t.view(torch.uint8).reshape(-1))
-            self._nv.put(dst=dst_data, src=send_src, remote_pe=dst_group_rank, stream=self._stream)
+            self._nv.put(dst=dst_data, src=send_src, remote_pe=dst_group_rank, stream=self._nv_stream())
 
         with torch.no_grad():
             sender_sid, recver_sid, mid = route_key
@@ -1908,7 +2060,7 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
                 dst=self._meta[slot],
                 src=self._tmp_meta,
                 remote_pe=dst_group_rank,
-                stream=self._stream,
+                stream=self._nv_stream(),
             )
             with torch.no_grad():
                 self._tmp_ready.fill_(ready_tag)
@@ -1916,18 +2068,62 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
                 dst=self._ready_flags[slot],
                 src=self._tmp_ready,
                 remote_pe=dst_group_rank,
-                stream=self._stream,
+                stream=self._nv_stream(),
             )
         # Payload, metadata, ready signaling, and later source/staging reuse are
         # ordered on this CUDA stream.  Keep an opt-in quiet for debugging or for
         # NVSHMEM builds that require stronger local completion semantics.
         if self._quiet_after_send:
-            self._nv.quiet(stream=self._stream)
+            self._nv.quiet(stream=self._nv_stream())
 
     def _recv_peer_tensor_into(
         self, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int, route_key=None
     ):
         """Wait for routed metadata, copy from staging into ``out``, then release the slot."""
+        return self._recv_peer_tensor_into_impl(
+            out, tensor_shape, src_group_rank, route_key=route_key
+        )
+
+    def _slot_streams(self, slot: int):
+        """Lazily created per-slot recv streams.
+
+        A single shared recv stream serializes all recv waits: a wait for a
+        not-yet-sent message blocks consumption (and the release ack) of every
+        later-enqueued message that has already arrived, which re-creates the
+        cross-rank cycle for deep interleaved schedules.  Per-slot streams keep
+        only the required order (sequential seqs of one slot) and let every
+        other message be consumed, and its slot acked, the moment it lands.
+        """
+        entry = self._slot_stream_pool.get(slot)
+        if entry is None:
+            stream_t = torch.cuda.Stream()
+            entry = (stream_t, self._nv.NvshmemStream(stream_t))
+            self._slot_stream_pool[slot] = entry
+        return entry
+
+    def _consume_slot_split(
+        self, out: torch.Tensor, slot: int, expected_bytes: int,
+        src_group_rank: int, route_key, seq: int, wait_tag: int = None,
+    ):
+        """Enqueue (optional wait +) copy + release on the slot's own stream."""
+        stream_t, stream_nv = self._slot_streams(slot)
+        ev_in = torch.cuda.Event()
+        ev_in.record(torch.cuda.current_stream())
+        with self._use_stream(stream_nv, stream_t):
+            stream_t.wait_event(ev_in)
+            out.record_stream(stream_t)
+            if wait_tag is not None:
+                self._call_nvshmem_wait_until(
+                    self._ready_flags[slot], int(wait_tag), exact=True
+                )
+            self._consume_slot_into(out, slot, expected_bytes, src_group_rank, route_key, seq)
+            ev_out = torch.cuda.Event()
+            ev_out.record(stream_t)
+        torch.cuda.current_stream().wait_event(ev_out)
+
+    def _recv_peer_tensor_into_impl(
+        self, out: torch.Tensor, tensor_shape: Shape, src_group_rank: int, route_key=None
+    ):
         if src_group_rank == self._rank:
             raise RuntimeError("NVSHMEM peer recv does not support self-recv")
         self._validate_route_key(route_key)
@@ -1949,19 +2145,66 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
                 f"{self._slot_bytes} bytes. Configure OCTOPIPE_NVSHMEM_P2P_BUFFER_BYTES for this run."
             )
 
-        slot = self._drain_ready_slots_all_sources(
-            expected_src_group_rank=src_group_rank,
-            expected_route=route_key,
-            expected_seq=expected,
-        )
+        if self._split_streams:
+            with self._use_stream(self._drain_nv_stream, self._drain_torch_stream):
+                slot = self._drain_ready_slots_all_sources(
+                    expected_src_group_rank=src_group_rank,
+                    expected_route=route_key,
+                    expected_seq=expected,
+                )
+        else:
+            slot = self._drain_ready_slots_all_sources(
+                expected_src_group_rank=src_group_rank,
+                expected_route=route_key,
+                expected_seq=expected,
+            )
         if slot is None:
             slot = self._slot_for_route(route_key, expected, src_group_rank=src_group_rank)
             self._trace_event(
                 f"recv-wait src={src_group_rank} dst={self._rank} route={route_key} "
                 f"seq={expected} slot={slot}"
             )
-            ready_local = self._ready_flags[slot]
-            self._call_nvshmem_wait_until(ready_local, expected_tag, exact=True)
+            if self._progress_recv:
+                spins = 0
+                while True:
+                    # A send-path drain may have stashed the expected payload.
+                    if self._try_pop_pending_payload(out, src_group_rank, route_key, expected):
+                        self._recv_peer_seq[expected_key] = expected
+                        self._trace_event(
+                            f"recv-pending src={src_group_rank} dst={self._rank} "
+                            f"route={route_key} seq={expected}"
+                        )
+                        return
+                    found = self._drain_ready_slots_all_sources(
+                        expected_src_group_rank=src_group_rank,
+                        expected_route=route_key,
+                        expected_seq=expected,
+                    )
+                    if found is not None:
+                        slot = found
+                        break
+                    spins += 1
+                    if spins % 512 == 0:
+                        time.sleep(0.0005)
+            else:
+                # Claim before enqueuing the wait so a host-side drain cannot
+                # steal the message this wait depends on.
+                self._claimed_slots.add(slot)
+                if self._split_streams:
+                    # Meta validation would host-block before arrival; skip it
+                    # on this path.
+                    self._trace_event(
+                        f"recv src={src_group_rank} dst={self._rank} route={route_key} "
+                        f"seq={expected} slot={slot} bytes={expected_bytes}"
+                    )
+                    self._recv_peer_seq[expected_key] = expected
+                    self._consume_slot_split(
+                        out, slot, expected_bytes, src_group_rank, route_key, expected,
+                        wait_tag=expected_tag,
+                    )
+                    return
+                ready_local = self._ready_flags[slot]
+                self._call_nvshmem_wait_until(ready_local, expected_tag, exact=True)
         if self._validate_expected_meta:
             self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
         self._trace_event(
@@ -1969,12 +2212,24 @@ void wait_until(torch::Tensor flag, int64_t expected, bool exact) {
             f"seq={expected} slot={slot} bytes={expected_bytes}"
         )
         self._recv_peer_seq[expected_key] = expected
+        if self._split_streams:
+            self._consume_slot_split(
+                out, slot, expected_bytes, src_group_rank, route_key, expected
+            )
+        else:
+            self._consume_slot_into(out, slot, expected_bytes, src_group_rank, route_key, expected)
 
+    def _consume_slot_into(
+        self, out: torch.Tensor, slot: int, expected_bytes: int,
+        src_group_rank: int, route_key, seq: int,
+    ):
         local = self._slot_slice(slot, expected_bytes)
         with torch.no_grad():
             out.view(torch.uint8).reshape(-1).copy_(local, non_blocking=True)
             self._release_slot(slot)
-        self._signal_remote_slot_release(slot, src_group_rank, route_key, expected)
+        self._signal_remote_slot_release(slot, src_group_rank, route_key, seq)
+        self._mark_slot_busy(slot)
+        self._claimed_slots.discard(slot)
 
     def _recv_peer_tensor(
         self,
@@ -2267,11 +2522,19 @@ class OctoPipeP2PCommunicator(NvshmemP2PCommunicator):
                 continue
 
             expected_bytes = self._shape_nbytes(s)
-            slot = self._drain_ready_slots_all_sources(
-                expected_src_group_rank=src_group_rank,
-                expected_route=route_key,
-                expected_seq=expected,
-            )
+            if self._split_streams:
+                with self._use_stream(self._drain_nv_stream, self._drain_torch_stream):
+                    slot = self._drain_ready_slots_all_sources(
+                        expected_src_group_rank=src_group_rank,
+                        expected_route=route_key,
+                        expected_seq=expected,
+                    )
+            else:
+                slot = self._drain_ready_slots_all_sources(
+                    expected_src_group_rank=src_group_rank,
+                    expected_route=route_key,
+                    expected_seq=expected,
+                )
             if slot is None:
                 slot = self._slot_for_route(route_key, expected, src_group_rank=src_group_rank)
                 ready = int(self._ready_flags[slot][0].item())
@@ -2280,11 +2543,14 @@ class OctoPipeP2PCommunicator(NvshmemP2PCommunicator):
 
             if self._validate_expected_meta:
                 self._validate_slot_meta(slot, src_group_rank, route_key, expected, expected_bytes)
-            local = self._slot_slice(slot, expected_bytes)
-            with torch.no_grad():
-                out.view(torch.uint8).reshape(-1).copy_(local, non_blocking=True)
-                self._release_slot(slot)
-            self._signal_remote_slot_release(slot, src_group_rank, route_key, expected)
+            if self._split_streams:
+                self._consume_slot_split(
+                    out, slot, expected_bytes, src_group_rank, route_key, expected
+                )
+            else:
+                self._consume_slot_into(
+                    out, slot, expected_bytes, src_group_rank, route_key, expected
+                )
             self._recv_peer_seq[expected_key] = expected
             outs.append(out)
             expected += 1
