@@ -113,8 +113,18 @@ def get_batch(data_iterator, vp_stage=None):
 
     if args.octopipe:
         on_active_stage = is_octopipe_first_or_last_pipeline_stage(vp_stage)
+        # Irregular OctoPipe placements can put the head/loss stage on any pp
+        # rank, so derive first/last from the global stage id, not from mpu.
+        from megatron.core.pipeline_parallel.utils import (
+            is_octopipe_first_stage,
+            is_octopipe_last_stage,
+        )
+        pipe_first_stage = is_octopipe_first_stage(vp_stage)
+        pipe_last_stage = is_octopipe_last_stage(vp_stage)
     else:
         on_active_stage = is_first_or_last_pipeline_stage(vp_stage)
+        pipe_first_stage = mpu.is_pipeline_first_stage()
+        pipe_last_stage = mpu.is_pipeline_last_stage()
 
     if not on_active_stage and not mtp_on_this_rank and not is_sft:
         return [None for _ in BATCH_KEYS]
@@ -142,8 +152,8 @@ def get_batch(data_iterator, vp_stage=None):
         seq_length=args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
-        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        is_pipeline_first_stage=pipe_first_stage,
+        is_pipeline_last_stage=pipe_last_stage,
     )
 
     if not on_active_stage and not mtp_on_this_rank:

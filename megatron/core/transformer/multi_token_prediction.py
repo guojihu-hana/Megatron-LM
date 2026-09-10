@@ -631,6 +631,10 @@ def mtp_on_this_rank(
         - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
           pipeline stage. The function returns True only on the last pipeline stage.
     """
+    if not mtp_num_layers:
+        # No MTP layers in the model at all. Short-circuit before indexing the
+        # layout: octopipe may pass vp_stage values outside the layout table.
+        return False
     mtp_on_this_rank = False
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
     if layout is not None:

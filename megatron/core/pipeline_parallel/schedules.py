@@ -3140,6 +3140,11 @@ def forward_backward_pipelining_of_octopipe(
                     _register_octopipe_wgrad_task(model[cid], chunk=cid, tag=(sid, mid))
 
                 input_tensor_grads[mid][sid] = input_tensor_grad
+                output_tensors[mid][sid] = None
+                input_tensors[mid][sid] = None
+                input_tensors_recv_buffer[mid][sid] = None
+                output_tensor_grads[mid][sid] = None
+                output_tensor_grads_recv_buffer[mid][sid] = None
             elif wtype == 'w':
                 # NOTE: W only FIFO execution order
                 if not octopipe_bwd_splitting:
