@@ -25,3 +25,11 @@ docs/apidocs
 # Git worktrees
 .worktrees/
 .claude/worktrees/
+*.log
+*.yaml
+*.md
+*.svg
+/octopipe/sweep/
+/octopipe/nemotron-h/47B/
+/.claude/
+/*_pipeline_gpu_opt.json
